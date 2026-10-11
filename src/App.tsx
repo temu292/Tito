@@ -15,9 +15,6 @@ import {
   SERVICES_VISIBILITY_EVENT,
   getCategories,
   getBoostPlans,
-  getUsers,
-  getCurrentUser,
-  setCurrentUser,
   getFavorites,
   toggleFavorite,
   getTransactions,
@@ -63,15 +60,13 @@ function AppContent() {
     user: authUser,
     isAuthenticated,
     canPublish,
-    canModerate,
-    selectDemoUser
+    canModerate
   } = useAuth();
 
   // Core Data State
   const [services, setServices] = useState<ServiceListing[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [boostPlans, setBoostPlans] = useState<BoostPlan[]>([]);
-  const [allUsers, setAllUsers] = useState<User[]>([]);
   const [favorites, setFavorites] = useState<string[]>([]);
   const [transactions, setTransactions] = useState<PaymentTransaction[]>([]);
   const [reports, setReports] = useState<ReportItem[]>([]);
@@ -104,7 +99,6 @@ function AppContent() {
   useEffect(() => {
     setCategories(getCategories());
     setBoostPlans(getBoostPlans());
-    setAllUsers(getUsers());
     setFavorites(getFavorites());
     setTransactions(getTransactions());
     setReports(getReports());
@@ -281,17 +275,6 @@ function AppContent() {
   }, [filteredAndSortedServices]);
 
   // Handlers
-  const handleSelectUser = (user: User) => {
-    selectDemoUser(user);
-    showToast(
-      'info',
-      `Has cambiado a la vista demo de ${user.name}`,
-      user.role === 'admin'
-        ? 'Modo Demostración (Inspección de administración de solo lectura)'
-        : `Vecino de ${user.neighborhood} (Modo demostración de solo lectura)`
-    );
-  };
-
   const handleToggleFavorite = (serviceId: string) => {
     const updated = toggleFavorite(serviceId);
     setFavorites(updated);
@@ -613,8 +596,6 @@ function AppContent() {
       {/* Header */}
       <Header
         currentUser={activeUser}
-        allUsers={allUsers}
-        onSelectUser={handleSelectUser}
         favoritesCount={favorites.length}
         onOpenFavorites={() => {
           setOnlyFavorites(true);

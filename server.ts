@@ -90,11 +90,69 @@ function getServiceRoleKeyStatus(): 'missing' | 'misconfigured' | 'configured' {
   return 'misconfigured';
 }
 
+function isSafePublicSupabaseAnonKey(rawKey: string): boolean {
+  const trimmed = (rawKey || '').trim();
+  if (!trimmed || trimmed.includes('YOUR_SUPABASE') || trimmed.startsWith('sb_secret_') || /\s/.test(trimmed)) {
+    return false;
+  }
+  const serviceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  if (serviceRoleKey && trimmed === serviceRoleKey) {
+    return false;
+  }
+  const jwtParts = trimmed.split('.');
+  if (jwtParts.length === 3) {
+    try {
+      const payloadJson = Buffer.from(jwtParts[1], 'base64url').toString('utf8');
+      const payload = JSON.parse(payloadJson);
+      if (payload && payload.role === 'service_role') {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+function getPublicSupabaseConfig(): {
+  configured: boolean;
+  url: string;
+  anonKey: string;
+  missingVars: string[];
+} {
+  const url = (process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '').trim();
+  const rawAnon = (
+    process.env.VITE_SUPABASE_ANON_KEY ||
+    process.env.SUPABASE_ANON_KEY ||
+    process.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
+    process.env.SUPABASE_PUBLISHABLE_KEY ||
+    ''
+  ).trim();
+  const validUrl = Boolean(url && url.startsWith('https://') && !url.includes('YOUR_SUPABASE'));
+  const validAnon = isSafePublicSupabaseAnonKey(rawAnon);
+  const missingVars: string[] = [];
+  if (!validUrl) missingVars.push('VITE_SUPABASE_URL');
+  if (!validAnon) missingVars.push('VITE_SUPABASE_ANON_KEY');
+
+  return {
+    configured: validUrl && validAnon,
+    url: validUrl ? url : '',
+    anonKey: validAnon ? rawAnon : '',
+    missingVars
+  };
+}
+
 // Server-side Supabase clients:
 // 1. `serverAuthSupabase`: used strictly for verifying user Bearer JWTs via `auth.getUser(token)`
 // 2. `serverAdminSupabase`: privileged client initialized ONLY when `SUPABASE_SERVICE_ROLE_KEY` is validly configured (never falls back to anon key)
 const serverSupabaseUrl = (process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '').trim();
-const serverAnonKey = (process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '').trim();
+const serverAnonKey = (
+  process.env.VITE_SUPABASE_ANON_KEY ||
+  process.env.SUPABASE_ANON_KEY ||
+  process.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
+  process.env.SUPABASE_PUBLISHABLE_KEY ||
+  ''
+).trim();
 const serverServiceRoleKey =
   getServiceRoleKeyStatus() === 'configured'
     ? (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim()
@@ -269,6 +327,20 @@ app.get('/api/health', (_req: Request, res: Response) => {
       paypalEnvironment: envType === 'live' ? 'live' : 'sandbox'
     }
   });
+});
+
+// 0.1 Public Supabase runtime configuration for client SPA when Vite build-time env vars are absent.
+// Strictly exposes ONLY the public URL and public anon/publishable key (never service_role or secret keys).
+app.get('/api/supabase/config', (_req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(getPublicSupabaseConfig());
+});
+
+app.get('/api/supabase/public-env.js', (_req: Request, res: Response) => {
+  const pub = getPublicSupabaseConfig();
+  res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(`window.__VECINOYA_SUPABASE_CONFIG__ = ${JSON.stringify(pub)};\n`);
 });
 
 // 0.25 Authenticated endpoint returning strictly a server-calculated boolean { isAdmin }

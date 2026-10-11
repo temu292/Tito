@@ -1,31 +1,142 @@
 import { createClient, SupabaseClient, User as SupabaseAuthUser, Session } from '@supabase/supabase-js';
 import { ServiceListing, User, UserProfileUpdate } from '../types';
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
+interface RuntimePublicSupabaseConfig {
+  configured?: boolean;
+  url?: string;
+  anonKey?: string;
+  missingVars?: string[];
+}
 
-export const isSupabaseConfigured = Boolean(
-  supabaseUrl &&
-  supabaseAnonKey &&
-  supabaseUrl.startsWith('https://') &&
-  !supabaseUrl.includes('YOUR_SUPABASE')
-);
+declare global {
+  interface Window {
+    __VECINOYA_SUPABASE_CONFIG__?: RuntimePublicSupabaseConfig;
+  }
+}
 
-export const supabase: SupabaseClient | null = isSupabaseConfigured
-  ? createClient(supabaseUrl, supabaseAnonKey, {
-      auth: {
-        persistSession: true,
-        autoRefreshToken: true,
-        detectSessionInUrl: true,
-        storage: window.localStorage
-      },
-      realtime: {
-        params: {
-          eventsPerSecond: 10
-        }
+function isValidClientAnonKey(rawKey: string): boolean {
+  const trimmed = (rawKey || '').trim();
+  if (!trimmed || trimmed.includes('YOUR_SUPABASE') || trimmed.startsWith('sb_secret_') || /\s/.test(trimmed)) {
+    return false;
+  }
+  const parts = trimmed.split('.');
+  if (parts.length === 3) {
+    try {
+      const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+      const payload = JSON.parse(atob(base64));
+      if (payload && payload.role === 'service_role') {
+        return false;
       }
-    })
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+function resolveInitialPublicConfig(): { url: string; anonKey: string; missingVars: string[] } {
+  const runtimeCfg =
+    typeof window !== 'undefined' ? window.__VECINOYA_SUPABASE_CONFIG__ : undefined;
+
+  const rawUrl = (
+    import.meta.env.VITE_SUPABASE_URL ||
+    runtimeCfg?.url ||
+    ''
+  ).trim();
+  const rawAnonKey = (
+    import.meta.env.VITE_SUPABASE_ANON_KEY ||
+    runtimeCfg?.anonKey ||
+    ''
+  ).trim();
+
+  const validUrl = Boolean(rawUrl && rawUrl.startsWith('https://') && !rawUrl.includes('YOUR_SUPABASE'));
+  const validAnonKey = isValidClientAnonKey(rawAnonKey);
+
+  const missingVars: string[] = [];
+  if (!validUrl) missingVars.push('VITE_SUPABASE_URL');
+  if (!validAnonKey) missingVars.push('VITE_SUPABASE_ANON_KEY');
+
+  return {
+    url: validUrl ? rawUrl : '',
+    anonKey: validAnonKey ? rawAnonKey : '',
+    missingVars
+  };
+}
+
+function createBrowserSupabaseClient(url: string, anonKey: string): SupabaseClient {
+  return createClient(url, anonKey, {
+    auth: {
+      persistSession: true,
+      autoRefreshToken: true,
+      detectSessionInUrl: true,
+      storage: typeof window !== 'undefined' ? window.localStorage : undefined
+    },
+    realtime: {
+      params: {
+        eventsPerSecond: 10
+      }
+    }
+  });
+}
+
+const initialConfig = resolveInitialPublicConfig();
+let currentMissingVars: string[] = initialConfig.missingVars;
+
+export let isSupabaseConfigured: boolean = Boolean(initialConfig.url && initialConfig.anonKey);
+
+export let supabase: SupabaseClient | null = isSupabaseConfigured
+  ? createBrowserSupabaseClient(initialConfig.url, initialConfig.anonKey)
   : null;
+
+let configFetchPromise: Promise<SupabaseClient | null> | null = null;
+
+export function getSupabaseConfigErrorMessage(): string {
+  if (currentMissingVars.length > 0) {
+    return `Configuración de Supabase incompleta: falta ${currentMissingVars.join(' y ')} en el entorno de ejecución.`;
+  }
+  return 'Supabase no está configurado en las variables de entorno (VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY).';
+}
+
+export async function ensureSupabaseClient(): Promise<SupabaseClient | null> {
+  if (supabase && isSupabaseConfigured) {
+    return supabase;
+  }
+  if (typeof window === 'undefined') {
+    return null;
+  }
+  if (!configFetchPromise) {
+    configFetchPromise = (async () => {
+      try {
+        const res = await fetch('/api/supabase/config', { cache: 'no-store' });
+        if (!res.ok) return null;
+        const data = (await res.json()) as RuntimePublicSupabaseConfig;
+        const url = (data?.url || '').trim();
+        const anonKey = (data?.anonKey || '').trim();
+        if (Array.isArray(data?.missingVars)) {
+          currentMissingVars = data.missingVars;
+        }
+        if (
+          url &&
+          url.startsWith('https://') &&
+          !url.includes('YOUR_SUPABASE') &&
+          isValidClientAnonKey(anonKey)
+        ) {
+          window.__VECINOYA_SUPABASE_CONFIG__ = { configured: true, url, anonKey, missingVars: [] };
+          currentMissingVars = [];
+          supabase = createBrowserSupabaseClient(url, anonKey);
+          isSupabaseConfigured = true;
+          return supabase;
+        }
+      } catch {
+        // ignore network errors and fall back to existing state
+      } finally {
+        configFetchPromise = null;
+      }
+      return supabase;
+    })();
+  }
+  return configFetchPromise;
+}
 
 /**
  * Maps a Supabase Auth user (auth.users) to the application User model
@@ -41,12 +152,12 @@ export function mapSupabaseUserToUser(authUser: SupabaseAuthUser): User {
     name: metadata.name || metadata.full_name || fallbackName,
     email: email,
     avatar:
-      metadata.avatar_url ||
-      metadata.avatar ||
-      `https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=200&q=80`,
-    neighborhood: metadata.neighborhood || 'Barrio por definir',
+      (metadata.avatar_url || metadata.avatar || '').includes('photo-1535713875002-d1d0cf377fde')
+        ? ''
+        : (metadata.avatar_url || metadata.avatar || ''),
+    neighborhood: metadata.neighborhood || '',
     city: metadata.city || 'Madrid',
-    bio: metadata.bio || 'Vecino registrado en VecinoYa',
+    bio: metadata.bio || '',
     phone: metadata.phone || '',
     // Never grant admin role from user_metadata (editable by the user via supabase.auth.updateUser).
     // Only recognize app_metadata.role on the client (note: client state never replaces server/RLS enforcement).
@@ -69,12 +180,13 @@ export async function authSignUp(
   password: string,
   profile: { name: string; neighborhood: string; city?: string; phone?: string }
 ): Promise<{ user: User | null; session: Session | null; error: string | null }> {
-  if (!supabase) {
-    return { user: null, session: null, error: 'Supabase no está configurado en las variables de entorno.' };
+  const client = await ensureSupabaseClient();
+  if (!client) {
+    return { user: null, session: null, error: getSupabaseConfigErrorMessage() };
   }
 
   try {
-    const { data, error } = await supabase.auth.signUp({
+    const { data, error } = await client.auth.signUp({
       email: email.trim(),
       password,
       options: {
@@ -102,12 +214,13 @@ export async function authSignIn(
   email: string,
   password: string
 ): Promise<{ user: User | null; session: Session | null; error: string | null }> {
-  if (!supabase) {
-    return { user: null, session: null, error: 'Supabase no está configurado.' };
+  const client = await ensureSupabaseClient();
+  if (!client) {
+    return { user: null, session: null, error: getSupabaseConfigErrorMessage() };
   }
 
   try {
-    const { data, error } = await supabase.auth.signInWithPassword({
+    const { data, error } = await client.auth.signInWithPassword({
       email: email.trim(),
       password
     });
@@ -124,9 +237,10 @@ export async function authSignIn(
 }
 
 export async function authSignOut(): Promise<{ error: string | null }> {
-  if (!supabase) return { error: null };
+  const client = await ensureSupabaseClient();
+  if (!client) return { error: null };
   try {
-    const { error } = await supabase.auth.signOut();
+    const { error } = await client.auth.signOut();
     return { error: error ? error.message : null };
   } catch (err: any) {
     return { error: err.message || 'Error al cerrar sesión.' };
@@ -134,11 +248,12 @@ export async function authSignOut(): Promise<{ error: string | null }> {
 }
 
 export async function authResetPassword(email: string): Promise<{ error: string | null }> {
-  if (!supabase) {
-    return { error: 'Supabase no está configurado.' };
+  const client = await ensureSupabaseClient();
+  if (!client) {
+    return { error: getSupabaseConfigErrorMessage() };
   }
   try {
-    const { error } = await supabase.auth.resetPasswordForEmail(email.trim(), {
+    const { error } = await client.auth.resetPasswordForEmail(email.trim(), {
       redirectTo: window.location.origin
     });
     return { error: error ? error.message : null };
@@ -150,12 +265,13 @@ export async function authResetPassword(email: string): Promise<{ error: string 
 export async function authUpdateProfile(
   updates: UserProfileUpdate
 ): Promise<{ user: User | null; error: string | null }> {
-  if (!supabase) {
-    return { user: null, error: 'Supabase no está configurado.' };
+  const client = await ensureSupabaseClient();
+  if (!client) {
+    return { user: null, error: getSupabaseConfigErrorMessage() };
   }
 
   try {
-    const { data, error } = await supabase.auth.updateUser({
+    const { data, error } = await client.auth.updateUser({
       data: {
         ...(updates.name ? { name: updates.name.trim() } : {}),
         ...(updates.phone !== undefined ? { phone: updates.phone.trim() } : {}),
@@ -178,9 +294,10 @@ export async function authUpdateProfile(
 }
 
 export async function authGetSession(): Promise<Session | null> {
-  if (!supabase) return null;
+  const client = await ensureSupabaseClient();
+  if (!client) return null;
   try {
-    const { data } = await supabase.auth.getSession();
+    const { data } = await client.auth.getSession();
     return data.session;
   } catch {
     return null;
@@ -190,9 +307,10 @@ export async function authGetSession(): Promise<Session | null> {
 export const getCurrentSession = authGetSession;
 
 export async function authGetUser(): Promise<User | null> {
-  if (!supabase) return null;
+  const client = await ensureSupabaseClient();
+  if (!client) return null;
   try {
-    const { data } = await supabase.auth.getUser();
+    const { data } = await client.auth.getUser();
     return data.user ? mapSupabaseUserToUser(data.user) : null;
   } catch {
     return null;
@@ -298,15 +416,18 @@ export function mapRowToService(row: ServiceRow): ServiceListing {
     row.contact_method && VALID_CONTACT_METHODS.includes(row.contact_method)
       ? row.contact_method
       : 'whatsapp';
-  const resolvedRating =
-    typeof row.author_rating === 'number' && !Number.isNaN(Number(row.author_rating))
-      ? Number(row.author_rating)
-      : 5.0;
   const resolvedReviewCount =
     typeof row.author_review_count === 'number' &&
     !Number.isNaN(Number(row.author_review_count)) &&
-    Number(row.author_review_count) >= 0
+    Number(row.author_review_count) > 0
       ? Number(row.author_review_count)
+      : 0;
+  const resolvedRating =
+    resolvedReviewCount > 0 &&
+    typeof row.author_rating === 'number' &&
+    !Number.isNaN(Number(row.author_rating)) &&
+    Number(row.author_rating) > 0
+      ? Number(row.author_rating)
       : 0;
   const resolvedStatus: 'active' | 'suspended' | 'draft' =
     row.status === 'draft'
@@ -314,6 +435,8 @@ export function mapRowToService(row: ServiceRow): ServiceListing {
       : row.status === 'suspended'
         ? 'suspended'
         : 'active';
+  const rawAvatar = row.author_avatar || '';
+  const cleanAvatar = rawAvatar.includes('photo-1535713875002-d1d0cf377fde') ? '' : rawAvatar;
 
   return {
     id: row.id,
@@ -331,9 +454,7 @@ export function mapRowToService(row: ServiceRow): ServiceListing {
     additionalNotes: row.additional_notes || undefined,
     authorId: row.author_id,
     authorName: row.author_name || 'Vecino',
-    authorAvatar:
-      row.author_avatar ||
-      'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=200&q=80',
+    authorAvatar: cleanAvatar,
     authorRating: resolvedRating,
     authorReviewCount: resolvedReviewCount,
     createdAt: row.created_at || new Date().toISOString(),
@@ -402,9 +523,7 @@ export function buildClientInsertRow(
     additional_notes: service.additionalNotes ? service.additionalNotes.trim() : null,
     author_id: trimmedAuthorId,
     author_name: (service.authorName || 'Vecino').trim() || 'Vecino',
-    author_avatar:
-      service.authorAvatar ||
-      'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=200&q=80',
+    author_avatar: (service.authorAvatar || '').trim(),
     status: editorialStatus
   };
 }
@@ -453,9 +572,7 @@ export function buildClientUpdateRow(service: ServiceListing): ClientServiceUpda
     contact_value: (service.contactValue || '').trim(),
     additional_notes: service.additionalNotes ? service.additionalNotes.trim() : null,
     author_name: (service.authorName || 'Vecino').trim() || 'Vecino',
-    author_avatar:
-      service.authorAvatar ||
-      'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=200&q=80',
+    author_avatar: (service.authorAvatar || '').trim(),
     status: editorialStatus
   };
 }

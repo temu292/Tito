@@ -1,7 +1,11 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { ServiceListing, User } from '../types';
 import { useAuth } from '../context/AuthContext';
-import { isSupabaseConfigured } from '../services/supabase';
+import {
+  isSupabaseConfigured,
+  ensureSupabaseClient,
+  getSupabaseConfigErrorMessage
+} from '../services/supabase';
 import {
   X,
   MapPin,
@@ -62,8 +66,24 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
   } = useAuth();
 
   const [activeTab, setActiveTab] = useState<'profile' | 'login' | 'register' | 'forgot_password'>(
-    isAuthenticated ? 'profile' : initialTab
+    isAuthenticated ? 'profile' : initialTab === 'register' ? 'register' : 'login'
   );
+  const [supabaseReady, setSupabaseReady] = useState<boolean>(isSupabaseConfigured);
+
+  useEffect(() => {
+    if (isOpen) {
+      if (isAuthenticated) {
+        setActiveTab('profile');
+      } else if (initialTab === 'register') {
+        setActiveTab('register');
+      } else {
+        setActiveTab('login');
+      }
+      ensureSupabaseClient().then(client => {
+        setSupabaseReady(Boolean(client));
+      });
+    }
+  }, [isOpen, isAuthenticated, initialTab]);
 
   // Login form state
   const [loginEmail, setLoginEmail] = useState('');
@@ -223,17 +243,12 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
         <div className="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-[#E5F3EF]/40">
           <div className="flex items-center gap-3">
             <h3 className="text-base font-bold text-[#0E5145]">
-              {isAuthenticated ? 'Mi Cuenta en VecinoYa' : 'Autenticación & Perfil de Vecino'}
+              {isAuthenticated ? 'Mi Cuenta en VecinoYa' : 'Acceso a VecinoYa'}
             </h3>
-            {isAuthenticated ? (
+            {isAuthenticated && (
               <span className="text-[10px] font-semibold uppercase px-2 py-0.5 bg-emerald-100 text-emerald-800 rounded-full flex items-center gap-1">
                 <CheckCircle2 className="w-3 h-3 text-emerald-600" />
-                Supabase Auth Activo
-              </span>
-            ) : (
-              <span className="text-[10px] font-semibold uppercase px-2 py-0.5 bg-amber-100 text-amber-800 rounded-full flex items-center gap-1">
-                <Info className="w-3 h-3 text-amber-600" />
-                Modo Demostración
+                Cuenta verificada
               </span>
             )}
           </div>
@@ -248,16 +263,6 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
         {/* Auth status tabs (when not authenticated, allow quick switching) */}
         {!isAuthenticated && (
           <div className="flex border-b border-slate-200 bg-slate-50/60 px-4 pt-2 gap-2 text-xs font-semibold overflow-x-auto">
-            <button
-              onClick={() => setActiveTab('profile')}
-              className={`px-3 py-2 border-b-2 transition-colors ${
-                activeTab === 'profile'
-                  ? 'border-[#146C5B] text-[#0E5145]'
-                  : 'border-transparent text-slate-500 hover:text-slate-800'
-              }`}
-            >
-              Ver Perfil Demo
-            </button>
             <button
               onClick={() => setActiveTab('login')}
               className={`flex items-center gap-1.5 px-3 py-2 border-b-2 transition-colors ${
@@ -278,7 +283,7 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
               }`}
             >
               <UserPlus className="w-3.5 h-3.5" />
-              Crear Cuenta Real
+              Crear Cuenta
             </button>
             <button
               onClick={() => setActiveTab('forgot_password')}
@@ -297,36 +302,8 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
         {/* Content Body */}
         <div className="overflow-y-auto p-6 space-y-6 flex-1">
           {/* TAB 1: PROFILE VIEW */}
-          {activeTab === 'profile' && (
+          {activeTab === 'profile' && isAuthenticated && (
             <>
-              {/* Notice for Demo Mode */}
-              {!isAuthenticated && (
-                <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 text-xs flex items-start gap-2.5">
-                  <Info className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                  <div className="space-y-1">
-                    <p className="font-bold">Estás viendo una cuenta de demostración local ({user.name})</p>
-                    <p className="text-amber-800">
-                      Los perfiles demo son de solo lectura. Para publicar anuncios con tu propia autoría verificada,
-                      inicia sesión o regístrate con tu correo en Supabase Auth.
-                    </p>
-                    <div className="pt-1 flex gap-2">
-                      <button
-                        onClick={() => setActiveTab('login')}
-                        className="px-2.5 py-1 bg-amber-600 text-white rounded-lg font-semibold hover:bg-amber-700 transition-colors"
-                      >
-                        Iniciar sesión
-                      </button>
-                      <button
-                        onClick={() => setActiveTab('register')}
-                        className="px-2.5 py-1 bg-white text-amber-900 border border-amber-300 rounded-lg font-semibold hover:bg-amber-100 transition-colors"
-                      >
-                        Crear cuenta
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              )}
-
               {/* Status message after edit */}
               {editSuccess && (
                 <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-center gap-2">
@@ -337,23 +314,23 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
 
               {/* User Profile Card */}
               <div className="flex flex-col sm:flex-row items-center sm:items-start gap-4 p-4 rounded-xl bg-[#F7F9F8] border border-slate-200">
-                <img
-                  src={user.avatar}
-                  alt={user.name}
-                  className="w-18 h-18 rounded-full object-cover ring-3 ring-[#146C5B]/20 shadow-xs shrink-0"
-                />
+                {user.avatar ? (
+                  <img
+                    src={user.avatar}
+                    alt={user.name}
+                    className="w-18 h-18 rounded-full object-cover ring-3 ring-[#146C5B]/20 shadow-xs shrink-0"
+                  />
+                ) : (
+                  <div className="w-18 h-18 rounded-full bg-[#146C5B] text-white flex items-center justify-center text-2xl font-bold ring-3 ring-[#146C5B]/20 shadow-xs shrink-0">
+                    {(user.name || 'U').charAt(0).toUpperCase()}
+                  </div>
+                )}
                 <div className="space-y-1 text-center sm:text-left flex-1 min-w-0">
                   <div className="flex flex-wrap items-center justify-center sm:justify-start gap-2">
                     <h4 className="text-lg font-bold text-slate-900">{user.name}</h4>
-                    {isAuthenticated ? (
-                      <span className="text-[10px] font-semibold uppercase px-2 py-0.5 bg-emerald-100 text-emerald-800 rounded-full">
-                        Usuario Autenticado
-                      </span>
-                    ) : (
-                      <span className="text-[10px] font-semibold uppercase px-2 py-0.5 bg-slate-200 text-slate-700 rounded-full">
-                        Demo
-                      </span>
-                    )}
+                    <span className="text-[10px] font-semibold uppercase px-2 py-0.5 bg-emerald-100 text-emerald-800 rounded-full">
+                      Usuario Autenticado
+                    </span>
                     {user.role === 'admin' && (
                       <span className="text-[10px] font-semibold uppercase px-2 py-0.5 bg-amber-100 text-amber-800 rounded-full">
                         Administrador
@@ -755,12 +732,11 @@ export const UserProfileModal: React.FC<UserProfileModalProps> = ({
                 </p>
               </div>
 
-              {!isSupabaseConfigured && (
+              {!supabaseReady && (
                 <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 flex items-start gap-2">
                   <AlertCircle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
                   <p>
-                    Supabase aún no está configurado en el archivo de entorno. Configura
-                    <code>VITE_SUPABASE_URL</code> y <code>VITE_SUPABASE_ANON_KEY</code> para conectar la base de datos real.
+                    {getSupabaseConfigErrorMessage()}
                   </p>
                 </div>
               )}

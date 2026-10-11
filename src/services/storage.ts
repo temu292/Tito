@@ -1,8 +1,6 @@
 import {
   BOOST_PLANS,
-  CATEGORIES,
-  INITIAL_SERVICES,
-  INITIAL_USERS
+  CATEGORIES
 } from '../data/initialData';
 import {
   BoostPlan,
@@ -10,12 +8,12 @@ import {
   ChatMessage,
   PaymentTransaction,
   ReportItem,
-  ServiceListing,
-  User
+  ServiceListing
 } from '../types';
 import {
   isSupabaseConfigured,
   supabase,
+  ensureSupabaseClient,
   mapRowToService,
   buildClientInsertRow,
   buildClientUpdateRow,
@@ -49,7 +47,10 @@ export interface CreateServiceRemoteResult {
   supabaseError?: SupabaseStructuredError;
 }
 
-const DEMO_AUTHOR_IDS = new Set(INITIAL_USERS.filter(u => u.isDemo).map(u => u.id));
+const PREVIEW_PERSONA_KEY = 'vecinoya_preview_persona_v2';
+const LEGACY_DEMO_USER_ID_PATTERN = /^user_(laura|carlos|elena|admin)$/;
+const LEGACY_DEMO_SERVICE_ID_PATTERN = /^srv_[1-6]$/;
+const LEGACY_DEMO_TX_ID_PATTERN = /^tx_seed_[1-2]$/;
 
 function sanitizeErrorText(text: unknown): string {
   if (!text) return '';
@@ -95,8 +96,148 @@ function notifyServicesVisibilityChanged(): void {
 }
 
 export function isDemoAuthorId(authorId: string): boolean {
-  return DEMO_AUTHOR_IDS.has(authorId);
+  return LEGACY_DEMO_USER_ID_PATTERN.test(authorId || '');
 }
+
+export function isDemoServiceId(serviceId: string): boolean {
+  return LEGACY_DEMO_SERVICE_ID_PATTERN.test(serviceId || '');
+}
+
+function isDemoTransactionRecord(tx: Partial<PaymentTransaction> | null | undefined): boolean {
+  if (!tx || typeof tx !== 'object') return true;
+  if (LEGACY_DEMO_TX_ID_PATTERN.test(String(tx.id || ''))) return true;
+  if (tx.provider === 'simulated_secure') return true;
+  if (isDemoServiceId(String(tx.serviceId || ''))) return true;
+  if (isDemoAuthorId(String(tx.userId || ''))) return true;
+  return false;
+}
+
+/**
+ * Purges only unequivocally identified demo records from localStorage while preserving
+ * all authentic user data, real services, real transactions, favorites, reports, and chats.
+ */
+export function purgeLegacyDemoStorage(): void {
+  if (typeof window === 'undefined' || typeof localStorage === 'undefined') return;
+
+  try {
+    // 1. Remove demo persona switcher key
+    localStorage.removeItem(PREVIEW_PERSONA_KEY);
+
+    // 2. Clean vecinoya_current_user_v2 only if it belongs to a demo persona
+    const rawUser = localStorage.getItem(CURRENT_USER_KEY);
+    if (rawUser) {
+      try {
+        const parsedUser = JSON.parse(rawUser);
+        if (
+          !parsedUser ||
+          parsedUser.isDemo === true ||
+          parsedUser.authProvider === 'demo' ||
+          isDemoAuthorId(String(parsedUser.id || ''))
+        ) {
+          localStorage.removeItem(CURRENT_USER_KEY);
+        }
+      } catch {
+        localStorage.removeItem(CURRENT_USER_KEY);
+      }
+    }
+
+    // 3. Clean vecinoya_services_v2 of seed ads (srv_1..srv_6) and demo authors
+    const rawServices = localStorage.getItem(SERVICES_KEY);
+    if (rawServices) {
+      try {
+        const parsedServices = JSON.parse(rawServices);
+        if (Array.isArray(parsedServices)) {
+          const realServices = parsedServices.filter(
+            s => s && s.id && !isDemoServiceId(String(s.id)) && !isDemoAuthorId(String(s.authorId || ''))
+          );
+          if (realServices.length !== parsedServices.length) {
+            localStorage.setItem(SERVICES_KEY, JSON.stringify(realServices));
+          }
+        }
+      } catch {
+        // preserve if unreadable
+      }
+    }
+
+    // 4. Clean vecinoya_transactions_v2 of simulated seed transactions (tx_seed_1, tx_seed_2)
+    const rawTx = localStorage.getItem(TRANSACTIONS_KEY);
+    if (rawTx) {
+      try {
+        const parsedTx = JSON.parse(rawTx);
+        if (Array.isArray(parsedTx)) {
+          const realTx = parsedTx.filter(tx => !isDemoTransactionRecord(tx));
+          if (realTx.length !== parsedTx.length) {
+            localStorage.setItem(TRANSACTIONS_KEY, JSON.stringify(realTx));
+          }
+        }
+      } catch {
+        // preserve if unreadable
+      }
+    }
+
+    // 5. Clean vecinoya_favorites_v2 of seed service IDs
+    const rawFavs = localStorage.getItem(FAVORITES_KEY);
+    if (rawFavs) {
+      try {
+        const parsedFavs = JSON.parse(rawFavs);
+        if (Array.isArray(parsedFavs)) {
+          const realFavs = parsedFavs.filter(id => typeof id === 'string' && !isDemoServiceId(id));
+          if (realFavs.length !== parsedFavs.length) {
+            localStorage.setItem(FAVORITES_KEY, JSON.stringify(realFavs));
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    // 6. Clean vecinoya_reports_v2 of reports targeting seed ads or created by demo users
+    const rawReports = localStorage.getItem(REPORTS_KEY);
+    if (rawReports) {
+      try {
+        const parsedReports = JSON.parse(rawReports);
+        if (Array.isArray(parsedReports)) {
+          const realReports = parsedReports.filter(
+            r =>
+              r &&
+              !isDemoServiceId(String(r.serviceId || '')) &&
+              !isDemoAuthorId(String(r.reporterId || ''))
+          );
+          if (realReports.length !== parsedReports.length) {
+            localStorage.setItem(REPORTS_KEY, JSON.stringify(realReports));
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    // 7. Clean vecinoya_chats_v2 of messages targeting seed ads or demo users
+    const rawChats = localStorage.getItem(CHAT_KEY);
+    if (rawChats) {
+      try {
+        const parsedChats = JSON.parse(rawChats);
+        if (Array.isArray(parsedChats)) {
+          const realChats = parsedChats.filter(
+            m =>
+              m &&
+              !isDemoServiceId(String(m.serviceId || '')) &&
+              !isDemoAuthorId(String(m.senderId || ''))
+          );
+          if (realChats.length !== parsedChats.length) {
+            localStorage.setItem(CHAT_KEY, JSON.stringify(realChats));
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    // ignore storage access errors
+  }
+}
+
+purgeLegacyDemoStorage();
 
 export function getDisconnectedAuthors(): string[] {
   try {
@@ -347,21 +488,20 @@ function readRawCachedServices(): ServiceListing[] {
   try {
     const raw = localStorage.getItem(SERVICES_KEY);
     if (!raw) {
-      if (!isSupabaseConfigured) {
-        localStorage.setItem(SERVICES_KEY, JSON.stringify(INITIAL_SERVICES));
-        return checkExpiration(INITIAL_SERVICES);
-      }
       return [];
     }
     const parsed = JSON.parse(raw) as ServiceListing[];
     if (!Array.isArray(parsed)) return [];
-    const cleaned = isSupabaseConfigured
-      ? parsed.filter(s => s && s.id && !isDemoAuthorId(s.authorId))
-      : parsed;
+    const cleaned = parsed.filter(
+      s => s && s.id && !isDemoServiceId(s.id) && !isDemoAuthorId(s.authorId)
+    );
+    if (cleaned.length !== parsed.length) {
+      localStorage.setItem(SERVICES_KEY, JSON.stringify(cleaned));
+    }
     return checkExpiration(cleaned);
   } catch (err) {
     console.error('Error reading services from localStorage:', err);
-    return isSupabaseConfigured ? [] : INITIAL_SERVICES;
+    return [];
   }
 }
 
@@ -382,13 +522,13 @@ export function getServices(activeAuthUserId?: string | null): ServiceListing[] 
   return Array.from(merged.values());
 }
 
-// Synchronous local storage save (deduplicated by ID, excluding demo seed items when Supabase is active)
+// Synchronous local storage save (deduplicated by ID, excluding demo seed items)
 export function saveServices(services: ServiceListing[]): void {
   try {
     const uniqueMap = new Map<string, ServiceListing>();
     for (const s of services) {
       if (s && s.id) {
-        if (isSupabaseConfigured && isDemoAuthorId(s.authorId)) {
+        if (isDemoServiceId(s.id) || isDemoAuthorId(s.authorId)) {
           continue;
         }
         uniqueMap.set(s.id, s);
@@ -523,14 +663,14 @@ export async function setUserServicesVisibilityRemote(
  * - Confirmed remote rows from `public.services` are the primary source of truth.
  * - Preserves local unconfirmed/pending services of the authenticated owner so `localStorage`
  *   is never overwritten with an empty array `[]` if a remote insert failed or is not yet confirmed.
- * - Excludes demo services from `INITIAL_SERVICES` when Supabase is configured.
  * - Keeps editorial drafts (`status = 'draft'`) and suspended services (`status = 'suspended'`) hidden from the public.
  */
 export async function fetchServicesFromRemote(activeAuthUserId?: string | null): Promise<ServiceListing[]> {
+  const client = (isSupabaseConfigured && supabase) ? supabase : await ensureSupabaseClient();
   let effectiveAuthUserId = activeAuthUserId;
-  if (effectiveAuthUserId === undefined && isSupabaseConfigured && supabase) {
+  if (effectiveAuthUserId === undefined && client) {
     try {
-      const { data: sessionData } = await supabase.auth.getSession();
+      const { data: sessionData } = await client.auth.getSession();
       effectiveAuthUserId = sessionData?.session?.user?.id || null;
     } catch {
       effectiveAuthUserId = null;
@@ -547,13 +687,13 @@ export async function fetchServicesFromRemote(activeAuthUserId?: string | null):
 
   await syncDisconnectedAuthorsFromServer(effectiveAuthUserId);
 
-  if (!isSupabaseConfigured || !supabase) {
+  if (!client) {
     return getServices(effectiveAuthUserId);
   }
 
   try {
     // Query only the verified columns of `public.services` (`status` and `author_id`)
-    let query = supabase.from('services').select('*');
+    let query = client.from('services').select('*');
     if (effectiveAuthUserId) {
       query = query.or(`status.eq.active,author_id.eq.${effectiveAuthUserId}`);
     } else {
@@ -628,10 +768,11 @@ export async function createServiceRemote(
   const editorialStatus: 'active' | 'draft' | 'suspended' =
     service.status === 'draft' ? 'draft' : 'active';
 
-  if (isSupabaseConfigured && supabase) {
+  const client = (isSupabaseConfigured && supabase) ? supabase : await ensureSupabaseClient();
+  if (client) {
     try {
       // 1. Verify real authenticated Supabase session and auth.uid()
-      const { data: sessionData, error: sessionErr } = await supabase.auth.getSession();
+      const { data: sessionData, error: sessionErr } = await client.auth.getSession();
       const sessionUser = sessionData?.session?.user;
       const authUid = sessionUser?.id ? String(sessionUser.id) : null;
 
@@ -714,17 +855,19 @@ export async function createServiceRemote(
         additionalNotes: service.additionalNotes ? service.additionalNotes.trim() : undefined,
         authorId: authUid,
         authorName: (service.authorName || 'Vecino').trim() || 'Vecino',
-        authorAvatar:
-          service.authorAvatar ||
-          'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=200&q=80',
+        authorAvatar: (service.authorAvatar || '').trim(),
         authorRating:
-          typeof service.authorRating === 'number' && Number.isFinite(service.authorRating)
+          typeof service.authorReviewCount === 'number' &&
+          service.authorReviewCount > 0 &&
+          typeof service.authorRating === 'number' &&
+          Number.isFinite(service.authorRating) &&
+          service.authorRating > 0
             ? service.authorRating
-            : 5.0,
+            : 0,
         authorReviewCount:
           typeof service.authorReviewCount === 'number' &&
           Number.isFinite(service.authorReviewCount) &&
-          service.authorReviewCount >= 0
+          service.authorReviewCount > 0
             ? service.authorReviewCount
             : 0,
         createdAt: service.createdAt || new Date().toISOString(),
@@ -869,9 +1012,10 @@ export async function updateServiceRemote(
     ownerSessionActive: service.ownerSessionActive ?? true
   };
 
-  if (isSupabaseConfigured && supabase) {
+  const client = (isSupabaseConfigured && supabase) ? supabase : await ensureSupabaseClient();
+  if (client) {
     try {
-      const { data: sessionData, error: sessionErr } = await supabase.auth.getSession();
+      const { data: sessionData, error: sessionErr } = await client.auth.getSession();
       const authUserId = sessionData?.session?.user?.id;
 
       if (sessionErr || !authUserId) {
@@ -892,7 +1036,7 @@ export async function updateServiceRemote(
       }
 
       // Verify ownership and moderation state against the remote database record
-      const { data: remoteRow, error: checkError } = await supabase
+      const { data: remoteRow, error: checkError } = await client
         .from('services')
         .select('id, author_id, status')
         .eq('id', updatedService.id)
@@ -932,7 +1076,7 @@ export async function updateServiceRemote(
         authorId: authUserId
       });
 
-      const { data: updatedRows, error } = await supabase
+      const { data: updatedRows, error } = await client
         .from('services')
         .update(updatePayload)
         .eq('id', updatedService.id)
@@ -1021,10 +1165,11 @@ export async function deleteServiceRemote(
 
   let verifiedOwnerId = expectedAuthorId || '';
 
-  if (isSupabaseConfigured && supabase) {
+  const client = (isSupabaseConfigured && supabase) ? supabase : await ensureSupabaseClient();
+  if (client) {
     try {
       // 1. Verify active Supabase Auth session
-      const { data: sessionData, error: sessionErr } = await supabase.auth.getSession();
+      const { data: sessionData, error: sessionErr } = await client.auth.getSession();
       const authUserId = sessionData?.session?.user?.id;
 
       if (sessionErr || !authUserId) {
@@ -1044,7 +1189,7 @@ export async function deleteServiceRemote(
       }
 
       // 2. Check if the service exists in Supabase 'services' table
-      const { data: remoteRow, error: checkError } = await supabase
+      const { data: remoteRow, error: checkError } = await client
         .from('services')
         .select('id, author_id')
         .eq('id', serviceId)
@@ -1073,7 +1218,7 @@ export async function deleteServiceRemote(
       }
 
       // 3. Execute DELETE restricted by id and author_id
-      const { data: deletedRows, error: deleteError } = await supabase
+      const { data: deletedRows, error: deleteError } = await client
         .from('services')
         .delete()
         .eq('id', serviceId)
@@ -1128,9 +1273,12 @@ export async function deleteServiceRemote(
 export async function fetchAdminStatusRemote(accessToken?: string): Promise<boolean> {
   try {
     let token = accessToken;
-    if (!token && isSupabaseConfigured && supabase) {
-      const { data: sessionData } = await supabase.auth.getSession();
-      token = sessionData?.session?.access_token;
+    if (!token) {
+      const client = (isSupabaseConfigured && supabase) ? supabase : await ensureSupabaseClient();
+      if (client) {
+        const { data: sessionData } = await client.auth.getSession();
+        token = sessionData?.session?.access_token;
+      }
     }
 
     if (!token) {
@@ -1177,7 +1325,8 @@ export async function adminUpdateServiceStatusRemote(
     };
   }
 
-  if (!isSupabaseConfigured || !supabase) {
+  const client = (isSupabaseConfigured && supabase) ? supabase : await ensureSupabaseClient();
+  if (!client) {
     return {
       success: false,
       error: 'Supabase Auth debe estar configurado para ejecutar acciones administrativas.'
@@ -1185,7 +1334,7 @@ export async function adminUpdateServiceStatusRemote(
   }
 
   try {
-    const { data: sessionData, error: sessionErr } = await supabase.auth.getSession();
+    const { data: sessionData, error: sessionErr } = await client.auth.getSession();
     const accessToken = sessionData?.session?.access_token;
 
     if (sessionErr || !accessToken) {
@@ -1266,7 +1415,8 @@ export async function adminDeleteServiceRemote(
     return { success: false, error: 'Falta el identificador del anuncio a eliminar.' };
   }
 
-  if (!isSupabaseConfigured || !supabase) {
+  const client = (isSupabaseConfigured && supabase) ? supabase : await ensureSupabaseClient();
+  if (!client) {
     return {
       success: false,
       error: 'Supabase Auth debe estar configurado para ejecutar acciones administrativas.'
@@ -1274,7 +1424,7 @@ export async function adminDeleteServiceRemote(
   }
 
   try {
-    const { data: sessionData, error: sessionErr } = await supabase.auth.getSession();
+    const { data: sessionData, error: sessionErr } = await client.auth.getSession();
     const accessToken = sessionData?.session?.access_token;
 
     if (sessionErr || !accessToken) {
@@ -1356,43 +1506,24 @@ export function getBoostPlans(): BoostPlan[] {
   return BOOST_PLANS;
 }
 
-export function getUsers(): User[] {
-  return INITIAL_USERS;
-}
-
-export function getCurrentUser(): User {
-  try {
-    const raw = localStorage.getItem(CURRENT_USER_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      const found = INITIAL_USERS.find(u => u.id === parsed.id);
-      if (found) return found;
-    }
-  } catch {
-    // ignore
-  }
-  return INITIAL_USERS[0];
-}
-
-export function setCurrentUser(user: User): void {
-  try {
-    localStorage.setItem(CURRENT_USER_KEY, JSON.stringify(user));
-  } catch {
-    // ignore
-  }
-}
-
 export function getFavorites(): string[] {
   try {
     const raw = localStorage.getItem(FAVORITES_KEY);
     if (!raw) return [];
-    return JSON.parse(raw) as string[];
+    const parsed = JSON.parse(raw) as string[];
+    if (!Array.isArray(parsed)) return [];
+    const cleaned = parsed.filter(id => typeof id === 'string' && !isDemoServiceId(id));
+    if (cleaned.length !== parsed.length) {
+      localStorage.setItem(FAVORITES_KEY, JSON.stringify(cleaned));
+    }
+    return cleaned;
   } catch {
     return [];
   }
 }
 
 export function toggleFavorite(serviceId: string): string[] {
+  if (!serviceId || isDemoServiceId(serviceId)) return getFavorites();
   const current = getFavorites();
   const exists = current.includes(serviceId);
   const updated = exists ? current.filter(id => id !== serviceId) : [...current, serviceId];
@@ -1408,53 +1539,25 @@ export function getTransactions(): PaymentTransaction[] {
   try {
     const raw = localStorage.getItem(TRANSACTIONS_KEY);
     if (!raw) {
-      const initialTx: PaymentTransaction[] = [
-        {
-          id: 'tx_seed_1',
-          serviceId: 'srv_1',
-          serviceTitle: 'Paseo responsable y cuidado cariñoso de perros',
-          userId: 'user_elena',
-          userName: 'Elena Gómez',
-          planId: 'premium',
-          planName: 'Plan Premium',
-          amount: 8.00,
-          currency: 'EUR',
-          status: 'completed',
-          createdAt: new Date(Date.now() - 5 * 86400000).toISOString(),
-          expiresAt: new Date(Date.now() + 25 * 86400000).toISOString(),
-          referenceCode: 'VY-PREM-89104',
-          provider: 'simulated_secure'
-        },
-        {
-          id: 'tx_seed_2',
-          serviceId: 'srv_2',
-          serviceTitle: 'Pequeñas reparaciones del hogar, fontanería y bricolaje',
-          userId: 'user_carlos',
-          userName: 'Carlos Romero',
-          planId: 'avanzado',
-          planName: 'Plan Avanzado',
-          amount: 5.00,
-          currency: 'EUR',
-          status: 'completed',
-          createdAt: new Date(Date.now() - 5 * 86400000).toISOString(),
-          expiresAt: new Date(Date.now() + 10 * 86400000).toISOString(),
-          referenceCode: 'VY-AVAN-44102',
-          provider: 'simulated_secure'
-        }
-      ];
-      localStorage.setItem(TRANSACTIONS_KEY, JSON.stringify(initialTx));
-      return initialTx;
+      return [];
     }
-    return JSON.parse(raw) as PaymentTransaction[];
+    const parsed = JSON.parse(raw) as PaymentTransaction[];
+    if (!Array.isArray(parsed)) return [];
+    const cleaned = parsed.filter(tx => !isDemoTransactionRecord(tx));
+    if (cleaned.length !== parsed.length) {
+      localStorage.setItem(TRANSACTIONS_KEY, JSON.stringify(cleaned));
+    }
+    return cleaned;
   } catch {
     return [];
   }
 }
 
 export function recordTransaction(tx: PaymentTransaction): void {
+  if (isDemoTransactionRecord(tx)) return;
   try {
     const current = getTransactions();
-    const updated = [tx, ...current];
+    const updated = [tx, ...current.filter(item => item.id !== tx.id)];
     localStorage.setItem(TRANSACTIONS_KEY, JSON.stringify(updated));
   } catch {
     // ignore
@@ -1465,7 +1568,15 @@ export function getReports(): ReportItem[] {
   try {
     const raw = localStorage.getItem(REPORTS_KEY);
     if (!raw) return [];
-    return JSON.parse(raw) as ReportItem[];
+    const parsed = JSON.parse(raw) as ReportItem[];
+    if (!Array.isArray(parsed)) return [];
+    const cleaned = parsed.filter(
+      r => r && !isDemoServiceId(String(r.serviceId || '')) && !isDemoAuthorId(String(r.reporterId || ''))
+    );
+    if (cleaned.length !== parsed.length) {
+      localStorage.setItem(REPORTS_KEY, JSON.stringify(cleaned));
+    }
+    return cleaned;
   } catch {
     return [];
   }
@@ -1498,11 +1609,19 @@ export function updateReportStatus(reportId: string, status: 'reviewed' | 'dismi
 }
 
 export function getChatMessages(serviceId: string): ChatMessage[] {
+  if (!serviceId || isDemoServiceId(serviceId)) return [];
   try {
     const raw = localStorage.getItem(CHAT_KEY);
     if (!raw) return [];
     const all = JSON.parse(raw) as ChatMessage[];
-    return all.filter(msg => msg.serviceId === serviceId);
+    if (!Array.isArray(all)) return [];
+    const cleaned = all.filter(
+      msg => msg && !isDemoServiceId(String(msg.serviceId || '')) && !isDemoAuthorId(String(msg.senderId || ''))
+    );
+    if (cleaned.length !== all.length) {
+      localStorage.setItem(CHAT_KEY, JSON.stringify(cleaned));
+    }
+    return cleaned.filter(msg => msg.serviceId === serviceId);
   } catch {
     return [];
   }
