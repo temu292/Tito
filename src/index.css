@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --brand-primary: #146C5B;
+    --brand-dark: #0E5145;
+    --brand-soft: #E5F3EF;
+    --brand-bg: #F7F9F8;
+    --brand-coral: #E07A5F;
+  }
+
+  body {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  }
+}
+

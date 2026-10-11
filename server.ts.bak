@@ -1,0 +1,272 @@
+import express, { Request, Response } from 'express';
+import { createServer as createViteServer } from 'vite';
+import path from 'path';
+import dotenv from 'dotenv';
+
+dotenv.config();
+
+const app = express();
+const PORT = Number(process.env.PORT) || 3000;
+const HOST = '0.0.0.0';
+
+app.use(express.json());
+
+// Official non-negotiable prices and durations defined strictly on the server
+const OFFICIAL_BOOST_PLANS: Record<string, { name: string; price: number; durationDays: number }> = {
+  basico: {
+    name: 'Plan Básico',
+    price: 1.50,
+    durationDays: 3
+  },
+  intermedio: {
+    name: 'Plan Intermedio',
+    price: 3.00,
+    durationDays: 7
+  },
+  avanzado: {
+    name: 'Plan Avanzado',
+    price: 5.00,
+    durationDays: 15
+  },
+  premium: {
+    name: 'Plan Premium',
+    price: 8.00,
+    durationDays: 30
+  }
+};
+
+// In-memory set to prevent duplicate order captures (replay protection)
+const capturedOrderIds = new Set<string>();
+
+const rawEnv = (process.env.PAYPAL_ENVIRONMENT || '').trim().toLowerCase();
+const isLive = rawEnv === 'live' || rawEnv === 'production' || (rawEnv !== 'sandbox' && (process.env.PAYPAL_CLIENT_ID?.startsWith('BA') || rawEnv.length > 20));
+const PAYPAL_API_BASE = isLive
+  ? 'https://api-m.paypal.com'
+  : 'https://api-m.sandbox.paypal.com';
+
+/**
+ * Helper to obtain PayPal OAuth2 access token securely using server-side credentials
+ */
+async function getPayPalAccessToken(): Promise<string> {
+  const clientId = process.env.PAYPAL_CLIENT_ID;
+  const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    throw new Error('MISSING_CREDENTIALS');
+  }
+
+  const auth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+  const response = await fetch(`${PAYPAL_API_BASE}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${auth}`,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: 'grant_type=client_credentials'
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error('PayPal OAuth error:', response.status, errorText);
+    throw new Error(`PayPal auth failed with status ${response.status}`);
+  }
+
+  const data = await response.json() as { access_token: string };
+  return data.access_token;
+}
+
+// 1. Check PayPal server configuration status
+app.get('/api/paypal/config', (_req: Request, res: Response) => {
+  const hasClientId = Boolean(process.env.PAYPAL_CLIENT_ID);
+  const hasClientSecret = Boolean(process.env.PAYPAL_CLIENT_SECRET);
+  const isConfigured = hasClientId && hasClientSecret;
+
+  res.json({
+    configured: isConfigured,
+    clientId: hasClientId ? process.env.PAYPAL_CLIENT_ID : null,
+    environment: isLive ? 'live' : 'sandbox',
+    currency: 'EUR',
+    officialPlans: OFFICIAL_BOOST_PLANS
+  });
+});
+
+// 2. Create PayPal Order endpoint
+app.post('/api/paypal/create-order', async (req: Request, res: Response) => {
+  try {
+    const { planId, serviceId } = req.body;
+
+    if (!planId || !OFFICIAL_BOOST_PLANS[planId]) {
+      res.status(400).json({ error: 'Plan de destacado inválido o no reconocido.' });
+      return;
+    }
+
+    if (!serviceId) {
+      res.status(400).json({ error: 'Falta el identificador del servicio a destacar.' });
+      return;
+    }
+
+    const plan = OFFICIAL_BOOST_PLANS[planId];
+    const amountStr = plan.price.toFixed(2); // strictly determined by server
+
+    const accessToken = await getPayPalAccessToken();
+
+    const orderPayload = {
+      intent: 'CAPTURE',
+      purchase_units: [
+        {
+          reference_id: `${serviceId}#${planId}`,
+          description: `VecinoYa - ${plan.name} (${plan.durationDays} días)`,
+          amount: {
+            currency_code: 'EUR',
+            value: amountStr
+          }
+        }
+      ],
+      application_context: {
+        brand_name: 'VecinoYa',
+        shipping_preference: 'NO_SHIPPING',
+        user_action: 'PAY_NOW'
+      }
+    };
+
+    const orderResponse = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(orderPayload)
+    });
+
+    const orderData = await orderResponse.json() as { id?: string; status?: string; message?: string };
+
+    if (!orderResponse.ok || !orderData.id) {
+      console.error('PayPal create order failure:', orderData);
+      res.status(orderResponse.status || 500).json({
+        error: orderData.message || 'Error al crear la orden en PayPal Sandbox.'
+      });
+      return;
+    }
+
+    res.json({
+      orderId: orderData.id,
+      status: orderData.status,
+      planName: plan.name,
+      amount: amountStr,
+      currency: 'EUR'
+    });
+  } catch (error: any) {
+    if (error.message === 'MISSING_CREDENTIALS') {
+      res.status(503).json({
+        error: 'Las credenciales de PayPal Sandbox (PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET) no están configuradas en las variables de entorno del servidor.'
+      });
+      return;
+    }
+    console.error('Error in /api/paypal/create-order:', error);
+    res.status(500).json({ error: error.message || 'Error interno del servidor al procesar la orden.' });
+  }
+});
+
+// 3. Capture PayPal Order endpoint
+app.post('/api/paypal/capture-order', async (req: Request, res: Response) => {
+  try {
+    const { orderId, planId, serviceId } = req.body;
+
+    if (!orderId) {
+      res.status(400).json({ error: 'Identificador de orden de PayPal no proporcionado.' });
+      return;
+    }
+
+    if (!planId || !OFFICIAL_BOOST_PLANS[planId]) {
+      res.status(400).json({ error: 'Plan de destacado inválido.' });
+      return;
+    }
+
+    // Replay attack prevention: check if this order was already processed
+    if (capturedOrderIds.has(orderId)) {
+      res.status(409).json({ error: 'Esta orden de PayPal ya fue capturada anteriormente.' });
+      return;
+    }
+
+    const plan = OFFICIAL_BOOST_PLANS[planId];
+    const accessToken = await getPayPalAccessToken();
+
+    const captureResponse = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders/${orderId}/capture`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const captureData = await captureResponse.json() as any;
+
+    if (!captureResponse.ok || captureData.status !== 'COMPLETED') {
+      console.error('PayPal capture failure:', captureData);
+      res.status(captureResponse.status || 400).json({
+        error: captureData.message || `La captura no se completó (Estado: ${captureData.status || 'FALLIDO'}).`
+      });
+      return;
+    }
+
+    // Mark as processed
+    capturedOrderIds.add(orderId);
+
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + plan.durationDays * 86400000).toISOString();
+    const captureDetail = captureData.purchase_units?.[0]?.payments?.captures?.[0];
+    const captureId = captureDetail?.id || orderId;
+
+    res.json({
+      success: true,
+      orderId,
+      captureId,
+      status: 'COMPLETED',
+      planId,
+      planName: plan.name,
+      durationDays: plan.durationDays,
+      amount: plan.price,
+      currency: 'EUR',
+      createdAt: now.toISOString(),
+      expiresAt,
+      payerEmail: captureData.payer?.email_address || null
+    });
+  } catch (error: any) {
+    if (error.message === 'MISSING_CREDENTIALS') {
+      res.status(503).json({
+        error: 'Credenciales de PayPal Sandbox no configuradas en el servidor.'
+      });
+      return;
+    }
+    console.error('Error in /api/paypal/capture-order:', error);
+    res.status(500).json({ error: error.message || 'Error al capturar la orden de PayPal.' });
+  }
+});
+
+// Setup Vite middleware in dev or static files in production
+async function startServer() {
+  const isProduction = process.env.NODE_ENV === 'production';
+
+  if (!isProduction) {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa'
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.resolve(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.resolve(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, HOST, () => {
+    console.log(`[VecinoYa Full-Stack Server] running on http://${HOST}:${PORT}`);
+  });
+}
+
+startServer().catch((err) => {
+  console.error('Failed to start VecinoYa server:', err);
+  process.exit(1);
+});

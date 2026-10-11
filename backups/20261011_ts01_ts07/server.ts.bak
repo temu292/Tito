@@ -1,0 +1,1087 @@
+import express, { Request, Response, NextFunction } from 'express';
+import { createServer as createViteServer } from 'vite';
+import path from 'path';
+import fs from 'fs';
+import dotenv from 'dotenv';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { ordersJournal, PayPalOrderJournalEntry } from './server_orders';
+
+dotenv.config();
+
+const app = express();
+const PORT = Number(process.env.PORT) || 3000;
+const HOST = '0.0.0.0';
+
+app.use(express.json());
+
+// Persistent tracking of disconnected author IDs (owners who explicitly closed their session)
+const PRESENCE_FILE_PATH = path.resolve(process.cwd(), 'data', 'session_presence.json');
+
+function readDisconnectedAuthors(): Set<string> {
+  try {
+    if (fs.existsSync(PRESENCE_FILE_PATH)) {
+      const raw = fs.readFileSync(PRESENCE_FILE_PATH, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed?.disconnectedAuthorIds)) {
+        return new Set<string>(parsed.disconnectedAuthorIds);
+      }
+    }
+  } catch (err) {
+    console.warn('Could not read session_presence.json:', err);
+  }
+  return new Set<string>();
+}
+
+function writeDisconnectedAuthors(set: Set<string>): void {
+  try {
+    const dir = path.dirname(PRESENCE_FILE_PATH);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(
+      PRESENCE_FILE_PATH,
+      JSON.stringify({ disconnectedAuthorIds: Array.from(set), updatedAt: new Date().toISOString() }, null, 2),
+      'utf-8'
+    );
+  } catch (err) {
+    console.warn('Could not write session_presence.json:', err);
+  }
+}
+
+const disconnectedAuthorIds = readDisconnectedAuthors();
+
+// Server-side Supabase client for JWT verification and backend operations
+const serverSupabaseUrl = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL || '';
+const serverSupabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '';
+
+export const serverSupabase: SupabaseClient | null = (serverSupabaseUrl && serverSupabaseKey)
+  ? createClient(serverSupabaseUrl, serverSupabaseKey, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false
+      }
+    })
+  : null;
+
+/**
+ * Middleware: Verify Supabase Auth JWT token
+ * Validates the Bearer token against Supabase Auth without trusting client-side headers.
+ */
+export async function requireAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'Autenticación requerida: falta cabecera Bearer token.' });
+    return;
+  }
+
+  const token = authHeader.split(' ')[1];
+  if (!token) {
+    res.status(401).json({ error: 'Token de autenticación no proporcionado.' });
+    return;
+  }
+
+  if (!serverSupabase) {
+    res.status(503).json({ error: 'Servicio de autenticación no configurado en el servidor.' });
+    return;
+  }
+
+  try {
+    const { data: { user }, error } = await serverSupabase.auth.getUser(token);
+    if (error || !user) {
+      res.status(401).json({ error: 'Token de sesión expirado o inválido.' });
+      return;
+    }
+
+    // Attach authenticated user identity to request object
+    (req as any).user = user;
+    next();
+  } catch (err: any) {
+    console.error('Error verifying Supabase JWT in requireAuth:', err);
+    res.status(500).json({ error: 'Error interno verificando la sesión del usuario.' });
+  }
+}
+
+// 0. Helper: Inspect SUPABASE_SERVICE_ROLE_KEY configuration state without exposing or assuming validity from prefix alone
+function getServiceRoleKeyStatus(): 'missing' | 'misconfigured' | 'configured' {
+  const rawKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  if (!rawKey) {
+    return 'missing';
+  }
+  const anonKey = (process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY || '').trim();
+  if (
+    (anonKey && rawKey === anonKey) ||
+    rawKey.startsWith('sb_publishable_') ||
+    rawKey.includes('YOUR_SUPABASE')
+  ) {
+    return 'misconfigured';
+  }
+  return 'configured';
+}
+
+/**
+ * Helper: Evaluate whether a server-verified Supabase Auth user holds trusted Admin permissions.
+ * Uses strictly server-verified sources:
+ *   1. user.app_metadata.role === 'admin' (managed solely by Supabase Auth server/service_role)
+ *   2. public.profiles.role === 'admin' via serverSupabase when privileged key is configured
+ *   3. Server-side ADMIN_EMAILS whitelist environment variable
+ * NEVER trusts user_metadata, client headers, request body, or demo personas.
+ */
+async function checkIsServerVerifiedAdmin(user: any): Promise<boolean> {
+  if (!user || !user.id) {
+    return false;
+  }
+
+  // 1. Source 1: Check verified claims in app_metadata (never user_metadata)
+  if (user.app_metadata?.role === 'admin') {
+    return true;
+  }
+
+  // 2. Source 2: If profiles table exists and serverSupabase has access via configured service_role/secret key, verify against public.profiles
+  if (serverSupabase && getServiceRoleKeyStatus() === 'configured') {
+    try {
+      const { data: profile, error } = await serverSupabase
+        .from('profiles')
+        .select('role')
+        .eq('id', user.id)
+        .maybeSingle();
+      if (!error && profile && profile.role === 'admin') {
+        return true;
+      }
+    } catch {
+      // Ignore if profiles table not yet deployed
+    }
+  }
+
+  // 3. Source 3: Trusted admin email whitelist in server environment (if configured)
+  if (process.env.ADMIN_EMAILS && user.email) {
+    const adminEmails = process.env.ADMIN_EMAILS
+      .split(',')
+      .map((e: string) => e.trim().toLowerCase())
+      .filter(Boolean);
+    if (adminEmails.includes(user.email.trim().toLowerCase())) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Helper: Validate service identifier format to prevent malformed requests or path/query manipulation
+ */
+function isValidServiceId(rawId: unknown): rawId is string {
+  if (typeof rawId !== 'string') return false;
+  const trimmed = rawId.trim();
+  if (trimmed.length < 1 || trimmed.length > 128) return false;
+  return /^[a-zA-Z0-9_-]+$/.test(trimmed);
+}
+
+/**
+ * Middleware: Verify that authenticated user has trusted Admin role on the server side
+ * Verifies app_metadata.role from verified JWT (managed solely by Supabase Auth server/service_role),
+ * or public.profiles table via service_role client, or server-side ADMIN_EMAILS configuration.
+ * NEVER trusts user_metadata (which can be edited by client), client headers, or demo state.
+ */
+export async function requireAdmin(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const user = (req as any).user;
+  if (!user || !user.id) {
+    res.status(401).json({ error: 'Autenticación requerida para acceder al área de administración.' });
+    return;
+  }
+
+  const isAdmin = await checkIsServerVerifiedAdmin(user);
+
+  if (!isAdmin) {
+    res.status(403).json({
+      error: 'Acceso denegado: se requieren permisos administrativos verificados en el servidor.'
+    });
+    return;
+  }
+
+  next();
+}
+
+// 0. Health & Diagnostics endpoint (without exposing any secret values)
+app.get('/api/health', (_req: Request, res: Response) => {
+  const hasSupabaseUrl = Boolean(process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL);
+  const hasSupabaseAnonKey = Boolean(process.env.VITE_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY);
+  const serviceRoleKeyStatus = getServiceRoleKeyStatus();
+  const hasServiceRoleKey = serviceRoleKeyStatus === 'configured';
+  const hasPaypalClientId = Boolean(process.env.PAYPAL_CLIENT_ID);
+  const hasPaypalClientSecret = Boolean(process.env.PAYPAL_CLIENT_SECRET);
+  const envType = (process.env.PAYPAL_ENVIRONMENT || '').trim().toLowerCase();
+
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    uptimeSeconds: Math.floor(process.uptime()),
+    environment: process.env.NODE_ENV || 'development',
+    configuration: {
+      supabaseUrlConfigured: hasSupabaseUrl,
+      supabaseAnonKeyConfigured: hasSupabaseAnonKey,
+      supabaseServiceRoleKeyConfigured: hasServiceRoleKey,
+      supabaseServiceRoleKeyStatus: serviceRoleKeyStatus,
+      paypalClientIdConfigured: hasPaypalClientId,
+      paypalClientSecretConfigured: hasPaypalClientSecret,
+      paypalEnvironment: envType === 'live' ? 'live' : 'sandbox'
+    }
+  });
+});
+
+// 0.25 Authenticated endpoint returning strictly a server-calculated boolean { isAdmin }
+// Uses the exact same trusted rules as requireAdmin without mutating app_metadata or trusting client input.
+app.get('/api/auth/admin-status', requireAuth, async (req: Request, res: Response) => {
+  const authUser = (req as any).user;
+  if (!authUser || !authUser.id) {
+    res.status(401).json({ error: 'Sesión no válida.' });
+    return;
+  }
+
+  const isAdmin = await checkIsServerVerifiedAdmin(authUser);
+  res.json({ isAdmin: Boolean(isAdmin) });
+});
+
+// 0.5 Session-linked service visibility endpoints
+// Note: Session presence NEVER alters the editorial `status` ('active' | 'draft' | 'suspended') of any service.
+app.get('/api/session/presence', (_req: Request, res: Response) => {
+  res.json({
+    disconnectedAuthorIds: Array.from(disconnectedAuthorIds)
+  });
+});
+
+app.post('/api/session/presence', requireAuth, async (req: Request, res: Response) => {
+  const authUser = (req as any).user;
+  if (!authUser || !authUser.id) {
+    res.status(401).json({ error: 'Sesión no válida.' });
+    return;
+  }
+
+  const isOnline = Boolean(req.body?.online);
+  if (isOnline) {
+    disconnectedAuthorIds.delete(authUser.id);
+  } else {
+    disconnectedAuthorIds.add(authUser.id);
+  }
+  writeDisconnectedAuthors(disconnectedAuthorIds);
+
+  res.json({
+    success: true,
+    userId: authUser.id,
+    online: isOnline,
+    disconnectedAuthorIds: Array.from(disconnectedAuthorIds)
+  });
+});
+
+// 0.75 Administrative Moderation Endpoints (Protected by requireAuth + requireAdmin)
+app.patch('/api/admin/services/:serviceId/status', requireAuth, requireAdmin, async (req: Request, res: Response) => {
+  const authUser = (req as any).user;
+  if (!authUser || !authUser.id) {
+    res.status(401).json({ error: 'Autenticación requerida.' });
+    return;
+  }
+
+  if (!serverSupabase || getServiceRoleKeyStatus() !== 'configured') {
+    res.status(503).json({
+      error: 'Moderación administrativa no disponible: el cliente privilegiado de Supabase no está configurado válidamente en el servidor.'
+    });
+    return;
+  }
+
+  const rawServiceId = req.params.serviceId;
+  if (!isValidServiceId(rawServiceId)) {
+    res.status(400).json({ error: 'Identificador de anuncio inválido.' });
+    return;
+  }
+  const serviceId = rawServiceId.trim();
+
+  if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+    res.status(400).json({ error: 'Cuerpo de solicitud inválido.' });
+    return;
+  }
+
+  const bodyKeys = Object.keys(req.body);
+  if (bodyKeys.length !== 1 || bodyKeys[0] !== 'status') {
+    res.status(400).json({
+      error: 'Solicitud rechazada: esta ruta solo permite actualizar la columna status.'
+    });
+    return;
+  }
+
+  const nextStatus = req.body.status;
+  if (nextStatus !== 'active' && nextStatus !== 'suspended') {
+    res.status(400).json({
+      error: "Valor de status inválido: solo se permite 'active' o 'suspended'."
+    });
+    return;
+  }
+
+  try {
+    const { data: existingService, error: fetchError } = await serverSupabase
+      .from('services')
+      .select('id, author_id, status')
+      .eq('id', serviceId)
+      .maybeSingle();
+
+    if (fetchError) {
+      res.status(502).json({
+        error: `Error al consultar el anuncio en Supabase (${fetchError.code || 'DB_ERROR'}): ${fetchError.message}`
+      });
+      return;
+    }
+
+    if (!existingService) {
+      res.status(404).json({ error: 'El anuncio especificado no existe en Supabase.' });
+      return;
+    }
+
+    const { data: updatedRows, error: updateError } = await serverSupabase
+      .from('services')
+      .update({ status: nextStatus })
+      .eq('id', serviceId)
+      .select('id, status, author_id');
+
+    if (updateError) {
+      res.status(502).json({
+        error: `No se pudo actualizar el estado del anuncio en Supabase (${updateError.code || 'DB_ERROR'}): ${updateError.message}`
+      });
+      return;
+    }
+
+    if (!updatedRows || updatedRows.length !== 1 || updatedRows[0].status !== nextStatus) {
+      res.status(500).json({
+        error: 'No se pudo confirmar la actualización de estado del anuncio en Supabase.'
+      });
+      return;
+    }
+
+    res.json({
+      success: true,
+      serviceId: updatedRows[0].id,
+      status: updatedRows[0].status,
+      authorId: updatedRows[0].author_id
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      error: err?.message || 'Error interno del servidor al actualizar el estado del anuncio.'
+    });
+  }
+});
+
+app.delete('/api/admin/services/:serviceId', requireAuth, requireAdmin, async (req: Request, res: Response) => {
+  const authUser = (req as any).user;
+  if (!authUser || !authUser.id) {
+    res.status(401).json({ error: 'Autenticación requerida.' });
+    return;
+  }
+
+  if (!serverSupabase || getServiceRoleKeyStatus() !== 'configured') {
+    res.status(503).json({
+      error: 'Moderación administrativa no disponible: el cliente privilegiado de Supabase no está configurado válidamente en el servidor.'
+    });
+    return;
+  }
+
+  const rawServiceId = req.params.serviceId;
+  if (!isValidServiceId(rawServiceId)) {
+    res.status(400).json({ error: 'Identificador de anuncio inválido.' });
+    return;
+  }
+  const serviceId = rawServiceId.trim();
+
+  try {
+    const { data: existingService, error: fetchError } = await serverSupabase
+      .from('services')
+      .select('id, author_id')
+      .eq('id', serviceId)
+      .maybeSingle();
+
+    if (fetchError) {
+      res.status(502).json({
+        error: `Error al verificar el anuncio en Supabase (${fetchError.code || 'DB_ERROR'}): ${fetchError.message}`
+      });
+      return;
+    }
+
+    if (!existingService) {
+      res.status(404).json({ error: 'El anuncio que intentas eliminar no existe en Supabase.' });
+      return;
+    }
+
+    const { data: deletedRows, error: deleteError } = await serverSupabase
+      .from('services')
+      .delete()
+      .eq('id', serviceId)
+      .select('id');
+
+    if (deleteError) {
+      res.status(502).json({
+        error: `Error al eliminar el anuncio en Supabase (${deleteError.code || 'DB_ERROR'}): ${deleteError.message}`
+      });
+      return;
+    }
+
+    if (!deletedRows || deletedRows.length !== 1) {
+      const { data: stillExists } = await serverSupabase
+        .from('services')
+        .select('id')
+        .eq('id', serviceId)
+        .maybeSingle();
+
+      if (stillExists) {
+        res.status(500).json({
+          error: 'No se pudo confirmar la eliminación del anuncio en Supabase.'
+        });
+        return;
+      }
+    }
+
+    res.json({
+      success: true,
+      deletedId: serviceId,
+      authorId: existingService.author_id
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      error: err?.message || 'Error interno del servidor al eliminar el anuncio.'
+    });
+  }
+});
+
+// Official non-negotiable prices and durations defined strictly on the server
+const OFFICIAL_BOOST_PLANS: Record<string, { name: string; price: number; durationDays: number }> = {
+  basico: {
+    name: 'Plan Básico',
+    price: 1.50,
+    durationDays: 3
+  },
+  intermedio: {
+    name: 'Plan Intermedio',
+    price: 3.00,
+    durationDays: 7
+  },
+  avanzado: {
+    name: 'Plan Avanzado',
+    price: 5.00,
+    durationDays: 15
+  },
+  premium: {
+    name: 'Plan Premium',
+    price: 8.00,
+    durationDays: 30
+  }
+};
+
+// In-memory set to prevent duplicate order captures (replay protection)
+const capturedOrderIds = new Set<string>();
+
+const rawEnv = (process.env.PAYPAL_ENVIRONMENT || '').trim().toLowerCase();
+const isLive = rawEnv === 'live' || rawEnv === 'production' || (rawEnv !== 'sandbox' && (process.env.PAYPAL_CLIENT_ID?.startsWith('BA') || rawEnv.length > 20));
+const PAYPAL_API_BASE = isLive
+  ? 'https://api-m.paypal.com'
+  : 'https://api-m.sandbox.paypal.com';
+
+/**
+ * Helper to obtain PayPal OAuth2 access token securely using server-side credentials
+ */
+async function getPayPalAccessToken(): Promise<string> {
+  const clientId = process.env.PAYPAL_CLIENT_ID;
+  const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    throw new Error('MISSING_CREDENTIALS');
+  }
+
+  const auth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+  const response = await fetch(`${PAYPAL_API_BASE}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${auth}`,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: 'grant_type=client_credentials'
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error('PayPal OAuth error:', response.status, errorText);
+    throw new Error(`PayPal auth failed with status ${response.status}`);
+  }
+
+  const data = await response.json() as { access_token: string };
+  return data.access_token;
+}
+
+/**
+ * Inspección del estado de la orden en PayPal (recuperación de cortes de red sin duplicar cobros)
+ */
+async function getPayPalOrderDetails(orderId: string, accessToken: string): Promise<any | null> {
+  try {
+    const res = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders/${orderId}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    if (res.ok) {
+      return await res.json();
+    }
+    return null;
+  } catch (err) {
+    console.error('Error fetching PayPal order details:', err);
+    return null;
+  }
+}
+
+// 1. Check PayPal server configuration status
+app.get('/api/paypal/config', (_req: Request, res: Response) => {
+  const hasClientId = Boolean(process.env.PAYPAL_CLIENT_ID);
+  const hasClientSecret = Boolean(process.env.PAYPAL_CLIENT_SECRET);
+  const isConfigured = hasClientId && hasClientSecret;
+
+  res.json({
+    configured: isConfigured,
+    clientId: hasClientId ? process.env.PAYPAL_CLIENT_ID : null,
+    environment: isLive ? 'live' : 'sandbox',
+    currency: 'EUR',
+    officialPlans: OFFICIAL_BOOST_PLANS
+  });
+});
+
+// 2. Create PayPal Order endpoint (Protected by requireAuth)
+app.post('/api/paypal/create-order', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const authUser = (req as any).user;
+    if (!authUser || !authUser.id) {
+      res.status(401).json({ error: 'Usuario no autenticado en Supabase.' });
+      return;
+    }
+
+    const { planId, serviceId, serviceTitle } = req.body;
+
+    if (!planId || !OFFICIAL_BOOST_PLANS[planId]) {
+      res.status(400).json({ error: 'Plan de destacado inválido o no reconocido.' });
+      return;
+    }
+
+    if (!serviceId) {
+      res.status(400).json({ error: 'Falta el identificador del servicio a destacar.' });
+      return;
+    }
+
+    // Verify that the authenticated user is the owner of the service
+    if (serverSupabase) {
+      const { data: srvRow } = await serverSupabase
+        .from('services')
+        .select('id, author_id')
+        .eq('id', serviceId)
+        .maybeSingle();
+
+      if (srvRow && srvRow.author_id !== authUser.id) {
+        res.status(403).json({
+          error: 'Acceso denegado: solo el propietario autenticado puede promocionar su propio anuncio.'
+        });
+        return;
+      }
+    }
+
+    const plan = OFFICIAL_BOOST_PLANS[planId];
+    const amountStr = plan.price.toFixed(2); // estrictamente determinado por el servidor
+
+    const accessToken = await getPayPalAccessToken();
+
+    // Payload de PayPal con custom_id para auditoría en el panel de PayPal
+    const orderPayload = {
+      intent: 'CAPTURE',
+      purchase_units: [
+        {
+          reference_id: `${serviceId}#${planId}`,
+          custom_id: JSON.stringify({ userId: authUser.id, serviceId, planId }),
+          description: `VecinoYa - ${plan.name} (${plan.durationDays} días)`,
+          amount: {
+            currency_code: 'EUR',
+            value: amountStr
+          }
+        }
+      ],
+      application_context: {
+        brand_name: 'VecinoYa',
+        shipping_preference: 'NO_SHIPPING',
+        user_action: 'PAY_NOW'
+      }
+    };
+
+    const orderResponse = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(orderPayload)
+    });
+
+    const orderData = await orderResponse.json() as { id?: string; status?: string; message?: string };
+
+    if (!orderResponse.ok || !orderData.id) {
+      console.error('PayPal create order failure:', orderData);
+      res.status(orderResponse.status || 500).json({
+        error: orderData.message || 'Error al crear la orden en PayPal Sandbox.'
+      });
+      return;
+    }
+
+    // Vincular y persistir la orden en el servidor con usuario, servicio y plan
+    ordersJournal.createOrder({
+      orderId: orderData.id,
+      userId: authUser.id,
+      userEmail: authUser.email,
+      userName: authUser.user_metadata?.name || authUser.email?.split('@')[0] || 'Vecino',
+      serviceId,
+      serviceTitle: serviceTitle || 'Servicio VecinoYa',
+      planId,
+      planName: plan.name,
+      amount: plan.price,
+      currency: 'EUR',
+      durationDays: plan.durationDays
+    });
+
+    // Intentar persistencia en public.payment_orders si Supabase con service_role está disponible
+    if (serverSupabase && process.env.SUPABASE_SERVICE_ROLE_KEY) {
+      try {
+        await serverSupabase.from('payment_orders').insert([{
+          order_id: orderData.id,
+          user_id: authUser.id,
+          service_id: serviceId,
+          service_title: serviceTitle || 'Servicio VecinoYa',
+          plan_id: planId,
+          plan_name: plan.name,
+          amount: plan.price,
+          currency: 'EUR',
+          duration_days: plan.durationDays,
+          status: 'CREATED',
+          sync_status: 'pending'
+        }]);
+      } catch (dbErr) {
+        // Tolerante a fallo si la tabla payment_orders aún está pendiente de migración
+      }
+    }
+
+    res.json({
+      orderId: orderData.id,
+      status: orderData.status,
+      planName: plan.name,
+      amount: amountStr,
+      currency: 'EUR'
+    });
+  } catch (error: any) {
+    if (error.message === 'MISSING_CREDENTIALS') {
+      res.status(503).json({
+        error: 'Las credenciales de PayPal Sandbox no están configuradas en el servidor.'
+      });
+      return;
+    }
+    console.error('Error in /api/paypal/create-order:', error);
+    res.status(500).json({ error: error.message || 'Error interno del servidor al procesar la orden.' });
+  }
+});
+
+// 3. Capture PayPal Order endpoint (Protected by requireAuth and persistent idempotency)
+app.post('/api/paypal/capture-order', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const authUser = (req as any).user;
+    if (!authUser || !authUser.id) {
+      res.status(401).json({ error: 'Usuario no autenticado en Supabase.' });
+      return;
+    }
+
+    const { orderId } = req.body;
+
+    if (!orderId) {
+      res.status(400).json({ error: 'Identificador de orden de PayPal no proporcionado.' });
+      return;
+    }
+
+    // Recuperar la orden registrada previamente en el servidor
+    const storedOrder = ordersJournal.getOrder(orderId);
+    if (!storedOrder) {
+      res.status(400).json({
+        error: 'Orden no encontrada o no originada válidamente en este servidor.'
+      });
+      return;
+    }
+
+    // Validación de propiedad: comprobar que el usuario autenticado es quien creó la orden
+    if (storedOrder.userId !== authUser.id) {
+      res.status(403).json({
+        error: 'Acceso no autorizado: la orden de pago pertenece a otra cuenta de usuario.'
+      });
+      return;
+    }
+
+    // Idempotencia persistente y protección contra doble cobro concurrente:
+    // 1. Si ya está completada, retornar respuesta cacheada
+    if (storedOrder.status === 'CAPTURED') {
+      res.json({
+        success: true,
+        idempotentReplay: true,
+        orderId: storedOrder.orderId,
+        captureId: storedOrder.captureId,
+        status: 'COMPLETED',
+        serviceId: storedOrder.serviceId,
+        serviceTitle: storedOrder.serviceTitle,
+        planId: storedOrder.planId,
+        planName: storedOrder.planName,
+        durationDays: storedOrder.durationDays,
+        amount: storedOrder.amount,
+        currency: 'EUR',
+        createdAt: storedOrder.createdAt,
+        expiresAt: storedOrder.expiresAt,
+        supabaseSyncStatus: storedOrder.supabaseSyncStatus
+      });
+      return;
+    }
+
+    // 2. Intentar adquirir bloqueo exclusivo de captura (evita condiciones de carrera simultáneas)
+    const lockResult = ordersJournal.claimCaptureLock(orderId);
+    if (!lockResult.success) {
+      if (lockResult.reason === 'ALREADY_CAPTURED') {
+        const captured = ordersJournal.getOrder(orderId);
+        res.json({
+          success: true,
+          idempotentReplay: true,
+          orderId: captured?.orderId,
+          captureId: captured?.captureId,
+          status: 'COMPLETED',
+          serviceId: captured?.serviceId,
+          serviceTitle: captured?.serviceTitle,
+          planId: captured?.planId,
+          planName: captured?.planName,
+          durationDays: captured?.durationDays,
+          amount: captured?.amount,
+          currency: 'EUR',
+          createdAt: captured?.createdAt,
+          expiresAt: captured?.expiresAt,
+          supabaseSyncStatus: captured?.supabaseSyncStatus
+        });
+        return;
+      }
+      res.status(409).json({
+        error: 'Procesamiento concurrente detectado: la captura de esta orden ya está en progreso en el servidor.'
+      });
+      return;
+    }
+
+    const plan = OFFICIAL_BOOST_PLANS[storedOrder.planId];
+    if (!plan) {
+      ordersJournal.releaseCaptureLock(orderId, 'PLAN_INVALIDO');
+      res.status(400).json({ error: 'Plan de destacado inválido en la orden registrada.' });
+      return;
+    }
+
+    let accessToken: string;
+    try {
+      accessToken = await getPayPalAccessToken();
+    } catch (tokenErr: any) {
+      ordersJournal.releaseCaptureLock(orderId, 'PAYPAL_AUTH_FAILED');
+      throw tokenErr;
+    }
+
+    let captureResponse: globalThis.Response;
+    try {
+      captureResponse = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders/${orderId}/capture`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+    } catch (netErr: any) {
+      ordersJournal.releaseCaptureLock(orderId, 'NETWORK_ERROR_CAPTURE');
+      throw netErr;
+    }
+
+    let captureData = await captureResponse.json() as any;
+
+    // Recuperación de estado: Si PayPal responde ORDER_ALREADY_CAPTURED (corte de red tras cobro),
+    // consultar el estado directamente en PayPal sin intentar cobrar de nuevo.
+    const isAlreadyCapturedInPayPal =
+      captureData?.name === 'ORDER_ALREADY_CAPTURED' ||
+      captureData?.details?.some((d: any) => d.issue === 'ORDER_ALREADY_CAPTURED');
+
+    if (!captureResponse.ok && isAlreadyCapturedInPayPal) {
+      console.warn(`[PayPal Recovery] Orden ${orderId} ya figuraba capturada en PayPal. Consultando estado...`);
+      const existingOrderInfo = await getPayPalOrderDetails(orderId, accessToken);
+      if (existingOrderInfo && existingOrderInfo.status === 'COMPLETED') {
+        captureData = existingOrderInfo;
+      }
+    }
+
+    if ((!captureResponse.ok && !isAlreadyCapturedInPayPal) || captureData.status !== 'COMPLETED') {
+      console.error('PayPal capture failure:', captureData);
+      ordersJournal.releaseCaptureLock(orderId, captureData.message || 'PAYPAL_CAPTURE_REJECTED');
+      res.status(captureResponse.status || 400).json({
+        error: captureData.message || `La captura no se completó (Estado: ${captureData.status || 'FALLIDO'}).`
+      });
+      return;
+    }
+
+    // Verificación estricta del monto y moneda en la respuesta real de PayPal
+    const captureDetail = captureData.purchase_units?.[0]?.payments?.captures?.[0];
+    const capturedAmount = parseFloat(captureDetail?.amount?.value || '0');
+    const capturedCurrency = captureDetail?.amount?.currency_code;
+
+    if (capturedCurrency !== 'EUR' || Math.abs(capturedAmount - storedOrder.amount) > 0.01) {
+      console.error('Monto o moneda capturada no coincide:', { capturedAmount, capturedCurrency, expected: storedOrder.amount });
+      ordersJournal.releaseCaptureLock(orderId, 'AMOUNT_MISMATCH');
+      res.status(400).json({
+        error: 'El importe o la divisa verificados en PayPal no coinciden con las especificaciones del plan del servidor.'
+      });
+      return;
+    }
+
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + storedOrder.durationDays * 86400000).toISOString();
+    const captureId = captureDetail?.id || orderId;
+    const payerEmail = captureData.payer?.email_address || undefined;
+
+    // Intentar sincronización atómica con Supabase (siempre que el service role key esté disponible)
+    let syncStatus: 'synced' | 'pending' | 'skipped_no_credentials' = 'pending';
+    let syncError: string | undefined = undefined;
+
+    const hasServiceRole = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+    if (serverSupabase && hasServiceRole) {
+      try {
+        // Intentar RPC atómica si ya fue creada en la migración
+        const { data: rpcData, error: rpcError } = await serverSupabase.rpc('activate_service_promotion', {
+          p_order_id: storedOrder.orderId,
+          p_capture_id: captureId,
+          p_service_id: storedOrder.serviceId,
+          p_service_title: storedOrder.serviceTitle,
+          p_user_id: storedOrder.userId,
+          p_user_name: storedOrder.userName || authUser.email,
+          p_plan_id: storedOrder.planId,
+          p_plan_name: storedOrder.planName,
+          p_amount: storedOrder.amount,
+          p_duration_days: storedOrder.durationDays,
+          p_expires_at: expiresAt,
+          p_payer_email: payerEmail || null
+        });
+
+        if (!rpcError) {
+          syncStatus = 'synced';
+        } else {
+          // Si el RPC aún no está creado, intentar inserción y actualización directa con service_role
+          const srvRes = await serverSupabase.from('services').update({
+            is_featured: true,
+            featured_plan_id: storedOrder.planId,
+            featured_plan_name: storedOrder.planName,
+            featured_until: expiresAt
+          }).eq('id', storedOrder.serviceId);
+
+          const txRes = await serverSupabase.from('payment_transactions').insert([{
+            id: captureId,
+            order_id: storedOrder.orderId,
+            service_id: storedOrder.serviceId,
+            service_title: storedOrder.serviceTitle,
+            user_id: storedOrder.userId,
+            user_name: storedOrder.userName || authUser.email,
+            plan_id: storedOrder.planId,
+            plan_name: storedOrder.planName,
+            amount: storedOrder.amount,
+            currency: 'EUR',
+            status: 'completed',
+            provider: 'paypal',
+            payer_email: payerEmail || null,
+            created_at: now.toISOString(),
+            expires_at: expiresAt
+          }]);
+
+          if (!srvRes.error && !txRes.error) {
+            syncStatus = 'synced';
+          } else {
+            syncError = srvRes.error?.message || txRes.error?.message || 'Tablas pendientes en Supabase';
+            syncStatus = 'pending';
+          }
+        }
+      } catch (dbErr: any) {
+        syncError = dbErr.message || 'Excepción comunicando con Supabase';
+        syncStatus = 'pending';
+      }
+    } else {
+      syncStatus = 'pending';
+      syncError = 'Clave SUPABASE_SERVICE_ROLE_KEY no presente o tablas pendientes de migración.';
+    }
+
+    // Persistir el estado de la captura en el diario del servidor
+    const capturedOrder = ordersJournal.markCaptured(
+      orderId,
+      captureId,
+      payerEmail,
+      expiresAt,
+      syncStatus,
+      syncError
+    );
+
+    res.json({
+      success: true,
+      orderId,
+      captureId,
+      status: 'COMPLETED',
+      serviceId: storedOrder.serviceId,
+      serviceTitle: storedOrder.serviceTitle,
+      planId: storedOrder.planId,
+      planName: storedOrder.planName,
+      durationDays: storedOrder.durationDays,
+      amount: storedOrder.amount,
+      currency: 'EUR',
+      createdAt: now.toISOString(),
+      expiresAt,
+      payerEmail,
+      supabaseSyncStatus: capturedOrder.supabaseSyncStatus
+    });
+  } catch (error: any) {
+    if (error.message === 'MISSING_CREDENTIALS') {
+      res.status(503).json({
+        error: 'Credenciales de PayPal Sandbox no configuradas en el servidor.'
+      });
+      return;
+    }
+    console.error('Error in /api/paypal/capture-order:', error);
+    res.status(500).json({ error: error.message || 'Error al capturar la orden de PayPal.' });
+  }
+});
+
+// 4. Endpoint de historial financiero para el usuario autenticado
+app.get('/api/paypal/my-transactions', requireAuth, (req: Request, res: Response) => {
+  const authUser = (req as any).user;
+  const userOrders = ordersJournal.getUserOrders(authUser.id);
+  res.json({ transactions: userOrders });
+});
+
+// 5. Endpoint de conciliación de pagos pendientes de sincronizar con Supabase (Exclusivo administradores)
+app.post('/api/admin/reconcile-pending', requireAuth, requireAdmin, async (req: Request, res: Response) => {
+  const authUser = (req as any).user;
+  const hasServiceRole = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+  if (!serverSupabase || !hasServiceRole) {
+    res.status(503).json({
+      error: 'Conciliación no disponible: SUPABASE_SERVICE_ROLE_KEY no está configurado.'
+    });
+    return;
+  }
+
+  const pending = ordersJournal.getPendingSyncOrders();
+  const results: any[] = [];
+
+  for (const order of pending) {
+    try {
+      const targetExpiresAt = order.expiresAt || new Date(Date.now() + order.durationDays * 86400000).toISOString();
+      const targetCaptureId = order.captureId || order.orderId;
+
+      // 1. Intentar conciliación transaccional segura mediante activate_service_promotion RPC
+      let reconciledViaRpc = false;
+      try {
+        const { error: rpcErr } = await serverSupabase.rpc('activate_service_promotion', {
+          p_order_id: order.orderId,
+          p_capture_id: targetCaptureId,
+          p_service_id: order.serviceId,
+          p_service_title: order.serviceTitle,
+          p_user_id: order.userId,
+          p_user_name: order.userName || 'Vecino',
+          p_plan_id: order.planId,
+          p_plan_name: order.planName,
+          p_amount: order.amount,
+          p_duration_days: order.durationDays,
+          p_expires_at: targetExpiresAt,
+          p_payer_email: order.payerEmail || null
+        });
+
+        if (!rpcErr) {
+          reconciledViaRpc = true;
+          ordersJournal.updateSyncStatus(order.orderId, 'synced');
+          results.push({ orderId: order.orderId, status: 'synced', method: 'rpc' });
+        }
+      } catch {
+        // Fallback si la función RPC aún no está creada en Supabase
+      }
+
+      if (reconciledViaRpc) {
+        continue;
+      }
+
+      // 2. Fallback: Actualización directa si la RPC aún no ha sido migrada
+      const { error: srvErr } = await serverSupabase.from('services').update({
+        is_featured: true,
+        featured_plan_id: order.planId,
+        featured_plan_name: order.planName,
+        featured_until: targetExpiresAt
+      }).eq('id', order.serviceId);
+
+      const { error: txErr } = await serverSupabase.from('payment_transactions').upsert({
+        id: targetCaptureId,
+        order_id: order.orderId,
+        service_id: order.serviceId,
+        service_title: order.serviceTitle,
+        user_id: order.userId,
+        user_name: order.userName || 'Vecino',
+        plan_id: order.planId,
+        plan_name: order.planName,
+        amount: order.amount,
+        currency: 'EUR',
+        status: 'completed',
+        provider: 'paypal',
+        payer_email: order.payerEmail || null,
+        created_at: order.createdAt,
+        expires_at: targetExpiresAt
+      });
+
+      if (!srvErr && !txErr) {
+        ordersJournal.updateSyncStatus(order.orderId, 'synced');
+        results.push({ orderId: order.orderId, status: 'synced', method: 'direct' });
+      } else {
+        results.push({
+          orderId: order.orderId,
+          status: 'failed',
+          error: srvErr?.message || txErr?.message
+        });
+      }
+    } catch (err: any) {
+      results.push({ orderId: order.orderId, status: 'exception', error: err.message });
+    }
+  }
+
+  res.json({
+    totalPending: pending.length,
+    reconciledCount: results.filter(r => r.status === 'synced').length,
+    results
+  });
+});
+
+// Setup Vite middleware in dev or static files in production
+async function startServer() {
+  const isProduction = process.env.NODE_ENV === 'production';
+
+  if (!isProduction) {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa'
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.resolve(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (_req, res) => {
+      res.sendFile(path.resolve(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, HOST, () => {
+    console.log(`[VecinoYa Full-Stack Server] running on http://${HOST}:${PORT}`);
+  });
+}
+
+startServer().catch((err) => {
+  console.error('Failed to start VecinoYa server:', err);
+  process.exit(1);
+});

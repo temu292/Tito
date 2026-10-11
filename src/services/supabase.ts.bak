@@ -1,0 +1,114 @@
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { ServiceListing } from '../types';
+
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || '';
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || '';
+
+export const isSupabaseConfigured = Boolean(
+  supabaseUrl &&
+  supabaseAnonKey &&
+  supabaseUrl.startsWith('https://') &&
+  !supabaseUrl.includes('YOUR_SUPABASE')
+);
+
+export const supabase: SupabaseClient | null = isSupabaseConfigured
+  ? createClient(supabaseUrl, supabaseAnonKey, {
+      realtime: {
+        params: {
+          eventsPerSecond: 10
+        }
+      }
+    })
+  : null;
+
+// Database row interface matching PostgreSQL snake_case columns
+export interface ServiceRow {
+  id: string;
+  title: string;
+  category_id: string;
+  description: string;
+  price: number;
+  price_type: 'hora' | 'trabajo' | 'a_convenir';
+  neighborhood: string;
+  city: string;
+  availability: string;
+  image_url: string;
+  contact_method: 'whatsapp' | 'phone' | 'chat' | 'email';
+  contact_value: string;
+  additional_notes?: string | null;
+  author_id: string;
+  author_name: string;
+  author_avatar: string;
+  author_rating: number;
+  author_review_count: number;
+  status: 'active' | 'suspended' | 'draft';
+  is_featured: boolean;
+  featured_plan_id?: string | null;
+  featured_plan_name?: string | null;
+  featured_until?: string | null;
+  report_count: number;
+  created_at: string;
+  updated_at?: string;
+}
+
+// Convert Database Row (snake_case) -> Application Type (camelCase)
+export function mapRowToService(row: ServiceRow): ServiceListing {
+  return {
+    id: row.id,
+    title: row.title,
+    categoryId: row.category_id,
+    description: row.description,
+    price: Number(row.price),
+    priceType: row.price_type,
+    neighborhood: row.neighborhood,
+    city: row.city,
+    availability: row.availability,
+    imageUrl: row.image_url,
+    contactMethod: row.contact_method,
+    contactValue: row.contact_value,
+    additionalNotes: row.additional_notes || undefined,
+    authorId: row.author_id,
+    authorName: row.author_name,
+    authorAvatar: row.author_avatar,
+    authorRating: Number(row.author_rating),
+    authorReviewCount: Number(row.author_review_count),
+    createdAt: row.created_at,
+    status: row.status,
+    isFeatured: Boolean(row.is_featured),
+    featuredPlanId: row.featured_plan_id || undefined,
+    featuredPlanName: row.featured_plan_name || undefined,
+    featuredUntil: row.featured_until || undefined,
+    reportCount: Number(row.report_count || 0)
+  };
+}
+
+// Convert Application Type (camelCase) -> Database Row (snake_case)
+export function mapServiceToRow(service: ServiceListing): ServiceRow {
+  return {
+    id: service.id,
+    title: service.title,
+    category_id: service.categoryId,
+    description: service.description,
+    price: service.price,
+    price_type: service.priceType,
+    neighborhood: service.neighborhood,
+    city: service.city,
+    availability: service.availability,
+    image_url: service.imageUrl,
+    contact_method: service.contactMethod,
+    contact_value: service.contactValue,
+    additional_notes: service.additionalNotes || null,
+    author_id: service.authorId,
+    author_name: service.authorName,
+    author_avatar: service.authorAvatar,
+    author_rating: service.authorRating,
+    author_review_count: service.authorReviewCount,
+    status: service.status,
+    is_featured: service.isFeatured,
+    featured_plan_id: service.featuredPlanId || null,
+    featured_plan_name: service.featuredPlanName || null,
+    featured_until: service.featuredUntil || null,
+    report_count: service.reportCount || 0,
+    created_at: service.createdAt
+  };
+}

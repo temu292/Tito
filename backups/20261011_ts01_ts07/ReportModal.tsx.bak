@@ -1,0 +1,139 @@
+import React, { useState } from 'react';
+import { ReportItem, ServiceListing, User } from '../types';
+import { X, ShieldAlert, AlertTriangle, CheckCircle2 } from 'lucide-react';
+import { addReport } from '../services/storage';
+
+interface ReportModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  service: ServiceListing | null;
+  currentUser: User;
+  onReportSuccess: () => void;
+}
+
+export const ReportModal: React.FC<ReportModalProps> = ({
+  isOpen,
+  onClose,
+  service,
+  currentUser,
+  onReportSuccess,
+}) => {
+  const [reason, setReason] = useState('spam');
+  const [details, setDetails] = useState('');
+  const [isSubmitted, setIsSubmitted] = useState(false);
+
+  if (!isOpen || !service) return null;
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const report: ReportItem = {
+      id: `rep_${Date.now()}`,
+      serviceId: service.id,
+      serviceTitle: service.title,
+      reporterId: currentUser.id,
+      reporterName: currentUser.name,
+      reason,
+      details: details.trim(),
+      createdAt: new Date().toISOString(),
+      status: 'pending'
+    };
+
+    addReport(report);
+    setIsSubmitted(true);
+    setTimeout(() => {
+      setIsSubmitted(false);
+      onReportSuccess();
+      onClose();
+    }, 1500);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-5">
+      <div
+        className="relative bg-white w-full max-w-md rounded-2xl shadow-2xl border border-slate-200 overflow-hidden flex flex-col animate-in fade-in zoom-in-95 duration-200"
+        role="dialog"
+        aria-modal="true"
+      >
+        <div className="px-5 py-4 border-b border-slate-100 flex items-center justify-between bg-red-50/50">
+          <div className="flex items-center gap-2 text-red-800">
+            <ShieldAlert className="w-5 h-5 text-red-600" />
+            <h3 className="text-sm font-bold">
+              Denunciar anuncio a moderación
+            </h3>
+          </div>
+          <button
+            onClick={onClose}
+            className="p-1.5 text-slate-400 hover:text-slate-700 rounded-lg"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        {isSubmitted ? (
+          <div className="p-8 text-center space-y-3">
+            <CheckCircle2 className="w-12 h-12 text-emerald-600 mx-auto" />
+            <h4 className="text-base font-bold text-slate-900">
+              Denuncia enviada a revisión
+            </h4>
+            <p className="text-xs text-slate-600">
+              El equipo de moderación revisará este anuncio para garantizar un entorno vecinal seguro y de confianza.
+            </p>
+          </div>
+        ) : (
+          <form onSubmit={handleSubmit} className="p-5 space-y-4">
+            <p className="text-xs text-slate-600">
+              Estás denunciando el anuncio: <strong className="text-slate-900">{service.title}</strong>
+            </p>
+
+            <div>
+              <label className="block text-xs font-bold uppercase tracking-wider text-slate-700 mb-1.5">
+                Motivo principal de la denuncia
+              </label>
+              <select
+                value={reason}
+                onChange={(e) => setReason(e.target.value)}
+                className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs sm:text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#146C5B]"
+              >
+                <option value="spam">Spam, publicidad masiva o servicio falso</option>
+                <option value="estafa">Sospecha de fraude o cobro fraudulento</option>
+                <option value="datos_privados">Publica datos personales sin consentimiento</option>
+                <option value="contenido_inapropiado">Contenido inapropiado u ofensivo</option>
+                <option value="precio_falso">Precio engañoso o condiciones abusivas</option>
+                <option value="otro">Otro motivo</option>
+              </select>
+            </div>
+
+            <div>
+              <label className="block text-xs font-bold uppercase tracking-wider text-slate-700 mb-1.5">
+                Explica brevemente lo ocurrido
+              </label>
+              <textarea
+                rows={3}
+                placeholder="Aporta detalles para que los moderadores puedan contrastar la información..."
+                value={details}
+                onChange={(e) => setDetails(e.target.value)}
+                className="w-full p-2.5 bg-slate-50 border border-slate-200 rounded-xl text-xs sm:text-sm text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#146C5B]"
+              />
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={onClose}
+                className="px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-xl"
+              >
+                Cancelar
+              </button>
+              <button
+                type="submit"
+                className="px-4 py-2 text-xs font-bold text-white bg-red-600 hover:bg-red-700 rounded-xl shadow-xs transition-colors"
+              >
+                Enviar denuncia
+              </button>
+            </div>
+          </form>
+        )}
+      </div>
+    </div>
+  );
+};
